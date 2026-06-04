@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-IMAGE_NAME="${IMAGE_NAME:-triton-hot-loader}"
+IMAGE_NAME="${IMAGE_NAME:-ccr.ccs.tencentyun.com/clobotics/triton-hot-loader}"
 TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d-%H%M%S)}"
 FULL_TAG="${IMAGE_NAME}:${TIMESTAMP}"
 LATEST_TAG="${IMAGE_NAME}:latest"
