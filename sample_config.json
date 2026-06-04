@@ -1,0 +1,6 @@
+{
+  "unit_model": "ccr.ccs.tencentyun.com/clobotics/unit-model-init:unit_hpc_us_yolov8-20260107",
+  "sku_model": "ccr.ccs.tencentyun.com/clobotics/sku-model-init:sku_hpc_us_resnet-20260527",
+  "secondary_unit_model": "ccr.ccs.tencentyun.com/clobotics/unit-model-init:unit_hanging_product_yolov5-20230620",
+  "hanging_box_model": "ccr.ccs.tencentyun.com/clobotics/unit-model-init:unit_empty_space_uspg_yolov8-20260430"
+}
