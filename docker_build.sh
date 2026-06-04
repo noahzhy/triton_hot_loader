@@ -6,6 +6,7 @@ IMAGE_NAME="${IMAGE_NAME:-triton-hot-loader}"
 TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d-%H%M%S)}"
 FULL_TAG="${IMAGE_NAME}:${TIMESTAMP}"
 LATEST_TAG="${IMAGE_NAME}:latest"
+DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/amd64}"
 DOCKER_CLI_IMAGE="${DOCKER_CLI_IMAGE:-docker.m.daocloud.io/docker:28-cli}"
 PYTHON_BASE_IMAGE="${PYTHON_BASE_IMAGE:-docker.m.daocloud.io/library/python:3.11-slim}"
 APT_MIRROR="${APT_MIRROR:-http://mirrors.tuna.tsinghua.edu.cn/debian}"
@@ -13,24 +14,42 @@ APT_SECURITY_MIRROR="${APT_SECURITY_MIRROR:-http://mirrors.tuna.tsinghua.edu.cn/
 PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
 PIP_TRUSTED_HOST="${PIP_TRUSTED_HOST:-pypi.tuna.tsinghua.edu.cn}"
 
+BUILD_OUTPUT_ARGS=()
+HAS_EXPLICIT_OUTPUT=0
+for arg in "$@"; do
+    case "${arg}" in
+        --load|--push|--output|-o)
+            HAS_EXPLICIT_OUTPUT=1
+            break
+            ;;
+    esac
+done
+
+if [[ ${HAS_EXPLICIT_OUTPUT} -eq 0 ]]; then
+    BUILD_OUTPUT_ARGS=(--load)
+fi
+
 echo "[hot_triton] building ${FULL_TAG}"
+echo "[hot_triton] target platform: ${DOCKER_PLATFORM}"
 echo "[hot_triton] docker cli image: ${DOCKER_CLI_IMAGE}"
 echo "[hot_triton] python base image: ${PYTHON_BASE_IMAGE}"
 echo "[hot_triton] apt mirror: ${APT_MIRROR}"
 echo "[hot_triton] pip index: ${PIP_INDEX_URL}"
 
-docker build \
-  "$@" \
-  --build-arg "DOCKER_CLI_IMAGE=${DOCKER_CLI_IMAGE}" \
-  --build-arg "PYTHON_BASE_IMAGE=${PYTHON_BASE_IMAGE}" \
-  --build-arg "APT_MIRROR=${APT_MIRROR}" \
-  --build-arg "APT_SECURITY_MIRROR=${APT_SECURITY_MIRROR}" \
-  --build-arg "PIP_INDEX_URL=${PIP_INDEX_URL}" \
-  --build-arg "PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST}" \
-  -f "${SCRIPT_DIR}/Dockerfile" \
-  -t "${FULL_TAG}" \
-  -t "${LATEST_TAG}" \
-  "${SCRIPT_DIR}"
+docker buildx build \
+    "$@" \
+    "${BUILD_OUTPUT_ARGS[@]}" \
+    --platform "${DOCKER_PLATFORM}" \
+    --build-arg "DOCKER_CLI_IMAGE=${DOCKER_CLI_IMAGE}" \
+    --build-arg "PYTHON_BASE_IMAGE=${PYTHON_BASE_IMAGE}" \
+    --build-arg "APT_MIRROR=${APT_MIRROR}" \
+    --build-arg "APT_SECURITY_MIRROR=${APT_SECURITY_MIRROR}" \
+    --build-arg "PIP_INDEX_URL=${PIP_INDEX_URL}" \
+    --build-arg "PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST}" \
+    -f "${SCRIPT_DIR}/Dockerfile" \
+    -t "${FULL_TAG}" \
+    -t "${LATEST_TAG}" \
+    "${SCRIPT_DIR}"
 
 echo "[hot_triton] build completed: ${FULL_TAG}"
 echo "[hot_triton] latest tag updated: ${LATEST_TAG}"

@@ -13,6 +13,11 @@
 
 - `ccr.ccs.tencentyun.com/clobotics/tritonserver:24.12-py3`
 
+## 补充文档
+
+- 独立 CLI 命令手册：[`docs/cli/README.md`](docs/cli/README.md)
+- 项目 Skill：[`.codex/skills/triton-hot-loader/SKILL.md`](.codex/skills/triton-hot-loader/SKILL.md)
+
 ## 适用输入
 
 输入是一组 `占位键 -> image` 的 JSON，**系统只读取 value，不再把 key 当作 alias**：
@@ -191,7 +196,7 @@ UI 支持：
 1. 先确保 Triton 已按 `EXPLICIT` 模式启动。
 2. 启动 Web UI。
 3. 打开页面后，点击“填充示例 JSON”或手动粘贴配置。
-4. 如需让“本次 JSON 里已删除的镜像”自动下线，保持“自动卸载”勾选。
+4. 如需让“本次 JSON 里已删除的镜像”自动下线，手动勾选“自动卸载”。
 5. 点击“执行热加载”。
 6. 观察页面中的：
    - Triton Ready 状态

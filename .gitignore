@@ -2,3 +2,10 @@
 runtime/
 __pycache__/
 templates/
+.*
+!.codex/
+!.codex/skills/
+!.codex/skills/triton-hot-loader/
+!.codex/skills/triton-hot-loader/SKILL.md
+!.codex/skills/triton-hot-loader/agents/
+!.codex/skills/triton-hot-loader/agents/openai.yaml
