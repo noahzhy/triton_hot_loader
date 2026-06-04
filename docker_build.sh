@@ -16,6 +16,12 @@ PIP_TRUSTED_HOST="${PIP_TRUSTED_HOST:-pypi.tuna.tsinghua.edu.cn}"
 
 BUILD_OUTPUT_ARGS=()
 HAS_EXPLICIT_OUTPUT=0
+IS_MULTI_PLATFORM=0
+
+if [[ "${DOCKER_PLATFORM}" == *,* ]]; then
+    IS_MULTI_PLATFORM=1
+fi
+
 for arg in "$@"; do
     case "${arg}" in
         --load|--push|--output|-o)
@@ -26,6 +32,12 @@ for arg in "$@"; do
 done
 
 if [[ ${HAS_EXPLICIT_OUTPUT} -eq 0 ]]; then
+    if [[ ${IS_MULTI_PLATFORM} -eq 1 ]]; then
+        echo "[hot_triton] multi-platform builds cannot use the default docker exporter"
+        echo "[hot_triton] rerun with --push or another explicit --output, or set DOCKER_PLATFORM to a single platform"
+        exit 1
+    fi
+
     BUILD_OUTPUT_ARGS=(--load)
 fi
 
