@@ -57,6 +57,21 @@ tritonserver --model-control-mode=EXPLICIT --repository-poll-secs=0
 - `--request-timeout`：Triton API 超时秒数，默认 `60`
 - `--docker-binary`：Docker 可执行文件名，默认 `docker`
 
+如果你希望通过环境变量把 PVC 挂载点作为模型目录使用，可以设置：
+
+- `HOT_TRITON_MODEL_REPOSITORY=/repository`
+
+此时默认值会切换为：
+
+- `--model-repository=/repository`
+- `--state-file=/repository/.hot_loader/state.json`
+- `--staging-root=/repository/.staging`
+
+其中 `--image-model-root` 对应的是镜像内的仓库根目录。当前项目里：
+
+- 旧的 `apply` 路径会从 `${image_model_root}` 复制整个 bundle
+- 新增的 controller 风格接口 `POST /models/load-from-image` 会按模型复制 `${image_model_root}/{model_name}`
+
 这些参数的默认值来自 `HotLoaderConfig.default()`，也会读取环境变量或项目根目录 `.env`：
 
 - `TRT_IP` + `HTTP_PORT`：派生 `triton-url`
@@ -108,7 +123,8 @@ python3 cli.py serve \
 
 - 这个命令会前台阻塞运行
 - UI 首页默认是 `http://127.0.0.1:8090/`
-- 同一个进程里也会提供 `/api/status`、`/api/models`、`/api/apply-config` 等接口
+- 同一个进程里也会提供 `/api/status`、`/api/models`、`/api/apply-config`
+- 兼容 controller 方案的 `/runtime/health`、`/runtime/gpu-status`、`/models/load-from-image`
 
 ### `apply`
 

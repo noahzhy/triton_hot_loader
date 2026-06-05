@@ -40,6 +40,35 @@
 
 另外，所有 `mlman_config / mlmanconfig` 相关条目都会在解析配置时被自动忽略。
 
+如果你要按“一个请求里显式指定多个模型镜像”的 controller 风格调用，服务端现在也兼容以下载荷：
+
+```json
+{
+  "triton_url": "http://triton-server:8000",
+  "triton_metrics_url": "http://triton-server:8002/metrics",
+  "models": [
+    {
+      "model_name": "sku_classifier",
+      "image": "registry.xxx.com/models/sku-classifier:20260605"
+    },
+    {
+      "model_name": "volume_detector",
+      "image": "registry.xxx.com/models/volume-detector:20260605"
+    }
+  ],
+  "options": {
+    "load_after_copy": true,
+    "overwrite": true
+  }
+}
+```
+
+这一路径下，当前项目的实际镜像内源路径是：
+
+- `/trt_models/{model_name}`
+
+不是 `/model-repository/{model_name}`。这个约定来自仓库现有实现 `HotLoaderConfig.image_model_root="/trt_models"` 和实际的 `docker cp` 逻辑。
+
 ## 目录说明
 
 当前目录下的关键文件：
@@ -55,9 +84,21 @@
 
 运行时会默认使用以下路径：
 
-- model repository：`hot_triton/runtime/model_repository`
-- state file：`hot_triton/runtime/state.json`
-- staging dir：`hot_triton/runtime/staging`
+- model repository：`runtime/model_repository`
+- state file：`runtime/state.json`
+- staging dir：`runtime/staging`
+
+如果你希望通过环境变量把 PVC 挂载点作为模型目录使用，可以显式设置：
+
+```bash
+HOT_TRITON_MODEL_REPOSITORY=/repository
+```
+
+此时默认路径会变成：
+
+- model repository：`/repository`
+- state file：`/repository/.hot_loader/state.json`
+- staging dir：`/repository/.staging`
 
 ## 前置条件
 
@@ -88,6 +129,15 @@
 
 - `/trt_models/<model_name>/<version>/...`
 - 可选的 `config.pbtxt`
+
+如果走新的 `POST /models/load-from-image` 接口，服务端会按单模型复制：
+
+- source path：`/trt_models/{model_name}`
+- target path：`runtime/model_repository/{model_name}`（Triton 容器内通常挂载为 `/models/{model_name}`）
+
+如果同时设置了 `HOT_TRITON_MODEL_REPOSITORY=/repository`，这里的 target path 会对应变成：
+
+- `/repository/{model_name}`
 
 > 第一版不会自动生成 `config.pbtxt`，请确保模型镜像里已经准备好 Triton 可识别的目录结构。
 
@@ -292,6 +342,24 @@ python /home/haoyu/projects/hot_triton/cli.py apply \
 
 ## HTTP API
 
+除了现有 `/api/*` 路径外，服务端也提供更贴近 controller 方案的兼容接口。
+
+### `GET /runtime/health`
+
+查看当前 Triton Ready 状态与实际连接的 Triton URL。
+
+```bash
+curl http://127.0.0.1:8090/runtime/health
+```
+
+### `GET /runtime/gpu-status`
+
+返回按 GPU 聚合后的显存、利用率和功耗摘要。
+
+```bash
+curl http://127.0.0.1:8090/runtime/gpu-status
+```
+
 ### `GET /api/status`
 
 查看 Triton 连通性、已管理镜像数量、model repository 路径等。
@@ -333,6 +401,39 @@ curl -X POST http://127.0.0.1:8090/api/apply-config \
     "force": false
   }'
 ```
+
+### `POST /models/load-from-image`
+
+按新方案里的 `models[]` 结构，串行执行“拉镜像 -> 复制单模型 -> 可选 load”：
+
+```bash
+curl -X POST http://127.0.0.1:8090/models/load-from-image \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "triton_url": "http://127.0.0.1:8000",
+    "triton_metrics_url": "http://127.0.0.1:8002/metrics",
+    "models": [
+      {
+        "model_name": "unit_detector",
+        "image": "registry.example.com/team/unit-detector:20260605"
+      },
+      {
+        "model_name": "sku_classifier",
+        "image": "registry.example.com/team/sku-classifier:20260605"
+      }
+    ],
+    "options": {
+      "load_after_copy": true,
+      "overwrite": true
+    }
+  }'
+```
+
+说明：
+
+- 这里按 `model_name` 从镜像内复制 `/trt_models/{model_name}`
+- `overwrite=false` 时，如果目标模型目录已存在会直接报错
+- `load_after_copy=false` 时只复制共享目录，不触发 Triton `load`
 
 ### `POST /api/unload`
 
@@ -385,7 +486,7 @@ curl -X POST http://127.0.0.1:8000/v2/repository/models/unit_detector/unload
 
 1. 接收一份 `占位键 -> image` 的 JSON 配置，并忽略 key。
 2. 对每个需要更新的镜像执行 `docker pull`。
-3. 使用 `docker create` + `docker cp` 从镜像中提取 `/trt_models`。
+3. 使用 `docker create` + `docker cp` 从镜像中提取模型目录。
 4. 扫描 bundle 中包含的 Triton 模型目录。
 5. 将模型目录写入共享的 model repository。
 6. 对应模型调用 Triton API：
@@ -393,6 +494,11 @@ curl -X POST http://127.0.0.1:8000/v2/repository/models/unit_detector/unload
   - 若存在 `config.pbtxt`，写入/更新 `version_policy: specific`
   - 直接调用 `load` 触发 Triton reload，并激活目标版本
 7. 将镜像与模型名、版本信息的映射关系写入 `runtime/state.json`。
+
+如果走 `POST /models/load-from-image`，第 3 步会进一步收敛为按单模型复制：
+
+- source path：`/trt_models/{model_name}`
+- target path：`runtime/model_repository/{model_name}`
 
 ## 验证与测试建议
 

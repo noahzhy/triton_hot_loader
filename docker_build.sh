@@ -48,20 +48,27 @@ echo "[hot_triton] python base image: ${PYTHON_BASE_IMAGE}"
 echo "[hot_triton] apt mirror: ${APT_MIRROR}"
 echo "[hot_triton] pip index: ${PIP_INDEX_URL}"
 
-docker buildx build \
-    "$@" \
-    "${BUILD_OUTPUT_ARGS[@]}" \
-    --platform "${DOCKER_PLATFORM}" \
-    --build-arg "DOCKER_CLI_IMAGE=${DOCKER_CLI_IMAGE}" \
-    --build-arg "PYTHON_BASE_IMAGE=${PYTHON_BASE_IMAGE}" \
-    --build-arg "APT_MIRROR=${APT_MIRROR}" \
-    --build-arg "APT_SECURITY_MIRROR=${APT_SECURITY_MIRROR}" \
-    --build-arg "PIP_INDEX_URL=${PIP_INDEX_URL}" \
-    --build-arg "PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST}" \
-    -f "${SCRIPT_DIR}/Dockerfile" \
-    -t "${FULL_TAG}" \
-    -t "${LATEST_TAG}" \
+BUILD_CMD=(
+    docker buildx build
+    "$@"
+    --platform "${DOCKER_PLATFORM}"
+    --build-arg "DOCKER_CLI_IMAGE=${DOCKER_CLI_IMAGE}"
+    --build-arg "PYTHON_BASE_IMAGE=${PYTHON_BASE_IMAGE}"
+    --build-arg "APT_MIRROR=${APT_MIRROR}"
+    --build-arg "APT_SECURITY_MIRROR=${APT_SECURITY_MIRROR}"
+    --build-arg "PIP_INDEX_URL=${PIP_INDEX_URL}"
+    --build-arg "PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST}"
+    -f "${SCRIPT_DIR}/Dockerfile"
+    -t "${FULL_TAG}"
+    -t "${LATEST_TAG}"
     "${SCRIPT_DIR}"
+)
+
+if [[ ${#BUILD_OUTPUT_ARGS[@]} -gt 0 ]]; then
+    BUILD_CMD=("${BUILD_CMD[@]:0:3}" "${BUILD_OUTPUT_ARGS[@]}" "${BUILD_CMD[@]:3}")
+fi
+
+"${BUILD_CMD[@]}"
 
 echo "[hot_triton] build completed: ${FULL_TAG}"
 echo "[hot_triton] latest tag updated: ${LATEST_TAG}"

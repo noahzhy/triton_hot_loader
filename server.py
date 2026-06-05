@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
 from urllib.parse import urlsplit, urlunsplit
 
 import uvicorn
@@ -31,6 +31,23 @@ class UnloadRequest(BaseModel):
 
 class ReloadRequest(BaseModel):
     models: List[str] = Field(default_factory=list)
+
+
+class LoadFromImageModelRequest(BaseModel):
+    model_name: str = Field(min_length=1)
+    image: str = Field(min_length=1)
+
+
+class LoadFromImageOptions(BaseModel):
+    load_after_copy: bool = True
+    overwrite: bool = True
+
+
+class LoadFromImageRequest(BaseModel):
+    triton_url: str | None = None
+    triton_metrics_url: str | None = None
+    models: List[LoadFromImageModelRequest] = Field(default_factory=list)
+    options: LoadFromImageOptions = Field(default_factory=LoadFromImageOptions)
 
 
 def _build_netloc_with_port(parts, port: int) -> str:
@@ -71,6 +88,50 @@ def _build_metrics_url_from_port(triton_url: str, port_text: str) -> str:
     )
 
 
+def _bytes_to_mb(value: Any) -> int | None:
+    if not isinstance(value, (int, float)):
+        return None
+    return int(round(value / (1024 * 1024)))
+
+
+def _format_runtime_gpu_status(metrics: Dict[str, object]) -> Dict[str, object]:
+    gpus: List[Dict[str, object]] = []
+    for gpu in metrics.get("gpus", []):
+        if not isinstance(gpu, dict):
+            continue
+        total_bytes = gpu.get("total_bytes")
+        used_bytes = gpu.get("used_bytes")
+        free_bytes = None
+        if isinstance(total_bytes, (int, float)) and isinstance(used_bytes, (int, float)):
+            free_bytes = total_bytes - used_bytes
+
+        gpus.append(
+            {
+                "gpu_index": gpu.get("index"),
+                "gpu_uuid": gpu.get("gpu_uuid"),
+                "gpu_bus_id": gpu.get("gpu_bus_id"),
+                "memory_total_mb": _bytes_to_mb(total_bytes),
+                "memory_used_mb": _bytes_to_mb(used_bytes),
+                "memory_free_mb": _bytes_to_mb(free_bytes),
+                "memory_used_percent": gpu.get("used_percent"),
+                "gpu_utilization_percent": gpu.get("utilization_percent"),
+                "power_draw_w": gpu.get("power_usage_watts"),
+                "power_limit_w": None,
+                "temperature_c": None,
+            }
+        )
+
+    status = "OK" if metrics.get("available") else "UNAVAILABLE"
+    return {
+        "status": status,
+        "detail": metrics.get("detail"),
+        "updated_at": metrics.get("updated_at"),
+        "source_url": metrics.get("url"),
+        "summary": metrics.get("summary"),
+        "gpus": gpus,
+    }
+
+
 def _get_request_loader(request: Request) -> TritonHotLoader:
     base_loader = request.app.state.loader
     override_url = request.headers.get(TRITON_URL_OVERRIDE_HEADER, "").strip()
@@ -92,6 +153,29 @@ def _get_request_loader(request: Request) -> TritonHotLoader:
         )
     )
     return override_loader
+
+
+def _build_loader_with_urls(
+    base_loader: TritonHotLoader,
+    *,
+    triton_url: str | None = None,
+    triton_metrics_url: str | None = None,
+) -> TritonHotLoader:
+    effective_triton_url = triton_url.strip() if isinstance(triton_url, str) else ""
+    effective_metrics_url = triton_metrics_url.strip() if isinstance(triton_metrics_url, str) else ""
+
+    if not effective_triton_url and not effective_metrics_url:
+        return base_loader
+
+    updates: Dict[str, object] = {}
+    if effective_triton_url:
+        updates["triton_url"] = effective_triton_url
+    if effective_metrics_url:
+        updates["triton_metrics_url"] = effective_metrics_url
+    elif effective_triton_url:
+        updates["triton_metrics_url"] = None
+
+    return TritonHotLoader(base_loader.config.with_updates(**updates))
 
 
 def create_app(loader: TritonHotLoader | None = None) -> FastAPI:
@@ -121,6 +205,17 @@ def create_app(loader: TritonHotLoader | None = None) -> FastAPI:
     async def healthz() -> Dict[str, str]:
         return {"status": "ok"}
 
+    @app.get("/runtime/health")
+    async def runtime_health(request: Request) -> Dict[str, object]:
+        loader = _get_request_loader(request)
+        ready = loader.triton_ready()
+        return {
+            "status": "ok" if ready["ready"] else "degraded",
+            "triton_ready": ready["ready"],
+            "triton_url": loader.config.triton_url,
+            "detail": ready["detail"],
+        }
+
     @app.get("/api/status")
     async def status(request: Request) -> Dict[str, object]:
         return _get_request_loader(request).get_status()
@@ -128,6 +223,11 @@ def create_app(loader: TritonHotLoader | None = None) -> FastAPI:
     @app.get("/api/gpu-metrics")
     async def gpu_metrics(request: Request) -> Dict[str, object]:
         return _get_request_loader(request).get_triton_gpu_metrics()
+
+    @app.get("/runtime/gpu-status")
+    async def runtime_gpu_status(request: Request) -> Dict[str, object]:
+        metrics = _get_request_loader(request).get_triton_gpu_metrics()
+        return _format_runtime_gpu_status(metrics)
 
     @app.get("/api/state")
     async def state(request: Request) -> Dict[str, object]:
@@ -152,6 +252,72 @@ def create_app(loader: TritonHotLoader | None = None) -> FastAPI:
             prune_missing=payload.prune_missing,
             force=payload.force,
         )
+
+    @app.post("/models/load-from-image")
+    async def load_from_image(payload: LoadFromImageRequest, request: Request) -> Dict[str, object]:
+        if not payload.models:
+            raise HotLoaderError("models 不能为空")
+
+        model_name_counts: Dict[str, int] = {}
+        for item in payload.models:
+            normalized_name = item.model_name.strip()
+            model_name_counts[normalized_name] = model_name_counts.get(normalized_name, 0) + 1
+        duplicate_models = sorted(
+            model_name for model_name, count in model_name_counts.items() if count > 1
+        )
+        if duplicate_models:
+            raise HotLoaderError(f"请求中存在重复 model_name: {', '.join(duplicate_models)}")
+
+        request_loader = _get_request_loader(request)
+        loader = _build_loader_with_urls(
+            request_loader,
+            triton_url=payload.triton_url,
+            triton_metrics_url=payload.triton_metrics_url,
+        )
+
+        result: Dict[str, object] = {
+            "success": True,
+            "triton_url": loader.config.triton_url,
+            "triton_metrics_url": loader.config.triton_metrics_url,
+            "options": payload.options.model_dump(),
+            "applied": [],
+            "skipped": [],
+            "errors": [],
+        }
+
+        applied: List[Dict[str, object]] = []
+        skipped: List[Dict[str, object]] = []
+        errors: List[Dict[str, object]] = []
+
+        for item in payload.models:
+            try:
+                operation = loader.load_model_from_image(
+                    item.model_name,
+                    item.image,
+                    overwrite=payload.options.overwrite,
+                    load_after_copy=payload.options.load_after_copy,
+                )
+            except HotLoaderError as exc:
+                result["success"] = False
+                errors.append(
+                    {
+                        "model_name": item.model_name,
+                        "image": item.image,
+                        "error": str(exc),
+                    }
+                )
+                continue
+
+            if operation.get("skipped"):
+                skipped.append(operation)
+            else:
+                applied.append(operation)
+
+        result["applied"] = applied
+        result["skipped"] = skipped
+        result["errors"] = errors
+        result["state"] = loader.get_managed_state()
+        return result
 
     @app.post("/api/unload")
     async def unload(payload: UnloadRequest, request: Request) -> Dict[str, object]:

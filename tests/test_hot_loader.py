@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from hot_loader import HotLoaderConfig, TritonHotLoader
+from hot_loader import HotLoaderConfig, TritonHotLoader, _default_runtime_paths
 
 
 def write_model_bundle(
@@ -99,6 +101,47 @@ class TritonHotLoaderVersionLoadingTests(unittest.TestCase):
         self.assertIn("version_policy:", config_text)
         self.assertIn("versions: [ 2 ]", config_text)
         self.assertNotIn("versions: [ 1 ]", config_text)
+
+    def test_stage_image_model_uses_project_image_root_plus_model_name(self) -> None:
+        commands: list[list[str]] = []
+
+        def fake_pull_image(image_ref: str) -> None:
+            commands.append(["docker", "pull", image_ref])
+
+        def fake_run_command(args, *, allow_failure: bool = False):
+            commands.append(list(args))
+            if args[:2] == ["docker", "create"]:
+                return subprocess.CompletedProcess(args, 0, stdout="container-123\n", stderr="")
+            if args[:2] == ["docker", "cp"]:
+                target_dir = Path(args[-1])
+                target_dir.mkdir(parents=True, exist_ok=True)
+                (target_dir / "config.pbtxt").write_text('name: "demo_model"\n', encoding="utf-8")
+                version_dir = target_dir / "1"
+                version_dir.mkdir(parents=True, exist_ok=True)
+                (version_dir / "model.onnx").write_text("fake\n", encoding="utf-8")
+                return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        self.loader._pull_image = fake_pull_image  # type: ignore[method-assign]
+        self.loader._run_command = fake_run_command  # type: ignore[method-assign]
+
+        stage_dir, bundle_dir = self.loader._stage_image_model(
+            "registry.example.com/demo:v1",
+            "demo_model",
+        )
+
+        self.assertEqual(
+            commands[2],
+            [
+                "docker",
+                "cp",
+                "container-123:/trt_models/demo_model/.",
+                str(bundle_dir / "demo_model"),
+            ],
+        )
+        self.assertTrue((bundle_dir / "demo_model" / "config.pbtxt").exists())
+        self.assertTrue((bundle_dir / "demo_model" / "1" / "model.onnx").exists())
+        self.assertTrue(stage_dir.exists())
 
     def test_validate_config_map_ignores_json_keys_and_skips_mlman_config(self) -> None:
         normalized = self.loader._validate_config_map(
@@ -259,6 +302,49 @@ class TritonHotLoaderVersionLoadingTests(unittest.TestCase):
         self.assertEqual(state["managed_model_versions"], {"legacy_model": ["20260530"]})
         self.assertEqual(state["managed_active_versions"], {"legacy_model": "20260530"})
 
+    def test_load_model_from_image_replaces_existing_model_and_updates_state(self) -> None:
+        write_model_bundle(self.config.model_repository, "demo_model", ["1"])
+        self.loader._save_state(
+            {
+                "aliases": {
+                    "legacy_alias": {
+                        "image": "registry.example.com/demo:old",
+                        "models": ["demo_model"],
+                        "model_versions": {"demo_model": ["1"]},
+                        "active_versions": {"demo_model": "1"},
+                        "updated_at": "2026-06-03T00:00:00+00:00",
+                    }
+                },
+                "updated_at": "2026-06-03T00:00:00+00:00",
+            }
+        )
+
+        stage_dir = self.config.staging_root / "load-from-image"
+        bundle_dir = stage_dir / "bundle"
+        write_model_bundle(bundle_dir, "demo_model", ["2"])
+
+        events: list[tuple[str, str]] = []
+        self.loader._stage_image_model = lambda image_ref, model_name: (stage_dir, bundle_dir)  # type: ignore[method-assign]
+        self.loader._unload_model = lambda model_name, tolerate_missing=True: events.append(("unload", model_name))
+        self.loader._load_model = lambda model_name: events.append(("load", model_name))
+
+        result = self.loader.load_model_from_image(
+            "demo_model",
+            "registry.example.com/demo:new",
+        )
+        state = self.loader.get_managed_state()
+        new_alias = result["alias"]
+        new_meta = state["aliases"][new_alias]
+
+        self.assertEqual(events, [("unload", "demo_model"), ("load", "demo_model")])
+        self.assertNotIn("legacy_alias", state["aliases"])
+        self.assertEqual(new_meta["image"], "registry.example.com/demo:new")
+        self.assertEqual(new_meta["models"], ["demo_model"])
+        self.assertEqual(new_meta["model_versions"], {"demo_model": ["2"]})
+        self.assertEqual(new_meta["active_versions"], {"demo_model": "2"})
+        self.assertFalse((self.config.model_repository / "demo_model" / "1").exists())
+        self.assertTrue((self.config.model_repository / "demo_model" / "2" / "model.onnx").exists())
+
     def test_write_active_version_policy_replaces_existing_policy(self) -> None:
         model_dir = write_model_bundle(
             self.config.model_repository,
@@ -352,6 +438,29 @@ nv_gpu_power_usage{gpu_uuid="GPU-bbb"} 75
                 },
             ],
         )
+
+
+class HotLoaderDefaultRuntimePathTests(unittest.TestCase):
+    def test_default_runtime_paths_use_env_controlled_repository_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir) / "runtime"
+            repository_path = Path(temp_dir) / "repository"
+
+            with patch.dict(os.environ, {"HOT_TRITON_MODEL_REPOSITORY": str(repository_path)}, clear=False):
+                model_repository, state_file, staging_root = _default_runtime_paths(base_dir)
+
+        self.assertEqual(model_repository, repository_path)
+        self.assertEqual(state_file, repository_path / ".hot_loader" / "state.json")
+        self.assertEqual(staging_root, repository_path / ".staging")
+
+    def test_default_runtime_paths_fall_back_to_local_runtime_when_mount_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir) / "runtime"
+            model_repository, state_file, staging_root = _default_runtime_paths(base_dir)
+
+        self.assertEqual(model_repository, base_dir / "model_repository")
+        self.assertEqual(state_file, base_dir / "state.json")
+        self.assertEqual(staging_root, base_dir / "staging")
 
     def test_default_config_reads_triton_url_from_environment(self) -> None:
         with patch("hot_loader._load_dotenv_values", return_value={}), patch.dict(

@@ -136,6 +136,101 @@ class ServerTritonUrlOverrideTests(unittest.TestCase):
             "http://10.0.0.8:19002/metrics",
         )
 
+    def test_load_from_image_route_uses_payload_urls_and_options(self) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_load_model_from_image(self, model_name, image, *, overwrite=True, load_after_copy=True):
+            captured["triton_url"] = self.config.triton_url
+            captured["triton_metrics_url"] = self.config.triton_metrics_url
+            captured["model_name"] = model_name
+            captured["image"] = image
+            captured["overwrite"] = overwrite
+            captured["load_after_copy"] = load_after_copy
+            return {
+                "success": True,
+                "skipped": False,
+                "alias": "model_demo",
+                "model_name": model_name,
+                "image": image,
+            }
+
+        with patch.object(TritonHotLoader, "load_model_from_image", fake_load_model_from_image), patch.object(
+            TritonHotLoader,
+            "get_managed_state",
+            return_value={"aliases": {}, "managed_images": []},
+        ):
+            response = self.client.post(
+                "/models/load-from-image",
+                json={
+                    "triton_url": "http://10.0.0.8:18000",
+                    "triton_metrics_url": "http://10.0.0.8:18002/metrics",
+                    "models": [
+                        {
+                            "model_name": "demo_model",
+                            "image": "registry.example.com/demo:new",
+                        }
+                    ],
+                    "options": {
+                        "load_after_copy": False,
+                        "overwrite": True,
+                    },
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(captured["triton_url"], "http://10.0.0.8:18000")
+        self.assertEqual(captured["triton_metrics_url"], "http://10.0.0.8:18002/metrics")
+        self.assertEqual(captured["model_name"], "demo_model")
+        self.assertEqual(captured["image"], "registry.example.com/demo:new")
+        self.assertTrue(captured["overwrite"])
+        self.assertFalse(captured["load_after_copy"])
+        self.assertEqual(response.json()["applied"][0]["model_name"], "demo_model")
+
+    def test_runtime_gpu_status_route_formats_summary_payload(self) -> None:
+        with patch.object(
+            TritonHotLoader,
+            "get_triton_gpu_metrics",
+            return_value={
+                "available": True,
+                "url": "http://127.0.0.1:8002/metrics",
+                "detail": "ok",
+                "updated_at": "2026-06-05T00:00:00+00:00",
+                "summary": {
+                    "device_count": 1,
+                    "used_bytes": 2 * 1024 * 1024,
+                    "total_bytes": 8 * 1024 * 1024,
+                    "used_ratio": 0.25,
+                    "used_percent": 25.0,
+                    "average_utilization_ratio": 0.75,
+                    "average_utilization_percent": 75.0,
+                    "total_power_usage_watts": 95.4,
+                },
+                "gpus": [
+                    {
+                        "index": 0,
+                        "gpu_uuid": "GPU-0",
+                        "gpu_bus_id": "0000:01:00.0",
+                        "used_bytes": 2 * 1024 * 1024,
+                        "total_bytes": 8 * 1024 * 1024,
+                        "used_percent": 25.0,
+                        "utilization_percent": 75.0,
+                        "power_usage_watts": 95.4,
+                    }
+                ],
+            },
+        ):
+            response = self.client.get("/runtime/gpu-status")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["status"], "OK")
+        self.assertEqual(payload["source_url"], "http://127.0.0.1:8002/metrics")
+        self.assertEqual(payload["gpus"][0]["gpu_index"], 0)
+        self.assertEqual(payload["gpus"][0]["memory_total_mb"], 8)
+        self.assertEqual(payload["gpus"][0]["memory_used_mb"], 2)
+        self.assertEqual(payload["gpus"][0]["memory_free_mb"], 6)
+        self.assertEqual(payload["gpus"][0]["gpu_utilization_percent"], 75.0)
+
 
 if __name__ == "__main__":
     unittest.main()

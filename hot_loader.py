@@ -37,6 +37,10 @@ _TRITON_METRICS_URL_ENV_NAMES = ("HOT_TRITON_TRITON_METRICS_URL",)
 _TRITON_HOST_ENV_NAMES = ("TRT_IP",)
 _TRITON_HTTP_PORT_ENV_NAMES = ("HTTP_PORT",)
 _TRITON_METRICS_PORT_ENV_NAMES = ("METRICS_PORT",)
+_RUNTIME_ROOT_ENV_NAMES = ("HOT_TRITON_RUNTIME_ROOT",)
+_MODEL_REPOSITORY_ENV_NAMES = ("HOT_TRITON_MODEL_REPOSITORY",)
+_STATE_FILE_ENV_NAMES = ("HOT_TRITON_STATE_FILE",)
+_STAGING_ROOT_ENV_NAMES = ("HOT_TRITON_STAGING_ROOT",)
 
 _EXPLICIT_CONTROL_HINT = (
     "当前 Triton 不允许通过 API 显式执行 load/unload。\n"
@@ -162,6 +166,61 @@ def _derived_triton_urls_from_env() -> tuple[str | None, str | None]:
     return triton_url, metrics_url
 
 
+def _default_runtime_paths(
+    base_dir: Path,
+) -> tuple[Path, Path, Path]:
+    explicit_runtime_root = _env_default(*_RUNTIME_ROOT_ENV_NAMES)
+    explicit_model_repository = _env_default(*_MODEL_REPOSITORY_ENV_NAMES)
+    explicit_state_file = _env_default(*_STATE_FILE_ENV_NAMES)
+    explicit_staging_root = _env_default(*_STAGING_ROOT_ENV_NAMES)
+
+    if explicit_runtime_root:
+        runtime_root = Path(explicit_runtime_root).expanduser()
+        model_repository = (
+            Path(explicit_model_repository).expanduser()
+            if explicit_model_repository
+            else runtime_root / "model_repository"
+        )
+        state_file = (
+            Path(explicit_state_file).expanduser()
+            if explicit_state_file
+            else runtime_root / "state.json"
+        )
+        staging_root = (
+            Path(explicit_staging_root).expanduser()
+            if explicit_staging_root
+            else runtime_root / "staging"
+        )
+        return model_repository, state_file, staging_root
+
+    if explicit_model_repository:
+        model_repository = Path(explicit_model_repository).expanduser()
+        state_file = (
+            Path(explicit_state_file).expanduser()
+            if explicit_state_file
+            else model_repository / ".hot_loader" / "state.json"
+        )
+        staging_root = (
+            Path(explicit_staging_root).expanduser()
+            if explicit_staging_root
+            else model_repository / ".staging"
+        )
+        return model_repository, state_file, staging_root
+
+    model_repository = base_dir / "model_repository"
+    state_file = (
+        Path(explicit_state_file).expanduser()
+        if explicit_state_file
+        else base_dir / "state.json"
+    )
+    staging_root = (
+        Path(explicit_staging_root).expanduser()
+        if explicit_staging_root
+        else base_dir / "staging"
+    )
+    return model_repository, state_file, staging_root
+
+
 @dataclass
 class HotLoaderConfig:
     """Configuration for the Triton hot loader."""
@@ -187,12 +246,13 @@ class HotLoaderConfig:
     def default(cls) -> "HotLoaderConfig":
         base_dir = Path(__file__).resolve().parent / "runtime"
         derived_triton_url, derived_metrics_url = _derived_triton_urls_from_env()
+        model_repository, state_file, staging_root = _default_runtime_paths(base_dir)
         return cls(
             triton_url=derived_triton_url or _env_default(*_TRITON_URL_ENV_NAMES) or _DEFAULT_TRITON_URL,
             triton_metrics_url=derived_metrics_url or _env_default(*_TRITON_METRICS_URL_ENV_NAMES),
-            model_repository=base_dir / "model_repository",
-            state_file=base_dir / "state.json",
-            staging_root=base_dir / "staging",
+            model_repository=model_repository,
+            state_file=state_file,
+            staging_root=staging_root,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -297,6 +357,11 @@ class TritonHotLoader:
         digest = hashlib.sha1(image_ref.encode("utf-8")).hexdigest()[:12]
         return f"bundle_{digest}"
 
+    @staticmethod
+    def _bundle_key_for_model_image(model_name: str, image_ref: str) -> str:
+        digest = hashlib.sha1(f"{model_name}\0{image_ref}".encode("utf-8")).hexdigest()[:12]
+        return f"model_{model_name}_{digest}"
+
     def _find_state_entry_by_image(
         self,
         aliases: Mapping[str, Any],
@@ -304,6 +369,19 @@ class TritonHotLoader:
     ) -> tuple[str | None, Mapping[str, Any] | None]:
         for alias, meta in aliases.items():
             if isinstance(meta, Mapping) and meta.get("image") == image_ref:
+                return alias, meta
+        return None, None
+
+    def _find_state_entry_by_model(
+        self,
+        aliases: Mapping[str, Any],
+        model_name: str,
+    ) -> tuple[str | None, Mapping[str, Any] | None]:
+        for alias, meta in aliases.items():
+            if not isinstance(meta, Mapping):
+                continue
+            models = meta.get("models", [])
+            if isinstance(models, list) and model_name in models:
                 return alias, meta
         return None, None
 
@@ -638,6 +716,18 @@ class TritonHotLoader:
     def _pull_image(self, image_ref: str) -> None:
         self._run_command([self.config.docker_binary, "pull", image_ref])
 
+    def _image_model_path(self, *parts: str) -> str:
+        root = self.config.image_model_root.rstrip("/")
+        if not root:
+            root = "/"
+
+        cleaned_parts = [part.strip("/") for part in parts if part and part.strip("/")]
+        if not cleaned_parts:
+            return root
+        if root == "/":
+            return "/" + "/".join(cleaned_parts)
+        return f"{root}/{'/'.join(cleaned_parts)}"
+
     def _stage_image_bundle(self, image_ref: str) -> tuple[Path, Path, List[str]]:
         operation_id = uuid.uuid4().hex[:12]
         stage_dir = self.config.staging_root / operation_id
@@ -656,7 +746,7 @@ class TritonHotLoader:
                 [
                     self.config.docker_binary,
                     "cp",
-                    f"{container_id}:{self.config.image_model_root}/.",
+                    f"{container_id}:{self._image_model_path()}/.",
                     str(bundle_dir),
                 ]
             )
@@ -673,6 +763,52 @@ class TritonHotLoader:
                 f"镜像 {image_ref} 中未发现模型目录，请确认 {self.config.image_model_root} 下是 Triton model repository 结构"
             )
         return stage_dir, bundle_dir, models
+
+    def _stage_image_model(self, image_ref: str, model_name: str) -> tuple[Path, Path]:
+        if not model_name or not model_name.strip():
+            raise HotLoaderError("model_name 不能为空")
+
+        normalized_model_name = model_name.strip()
+        operation_id = uuid.uuid4().hex[:12]
+        stage_dir = self.config.staging_root / operation_id
+        bundle_dir = stage_dir / "bundle"
+        model_stage_dir = bundle_dir / normalized_model_name
+        model_stage_dir.mkdir(parents=True, exist_ok=True)
+
+        self._pull_image(image_ref)
+
+        create_result = self._run_command([self.config.docker_binary, "create", image_ref])
+        container_id = create_result.stdout.strip()
+        if not container_id:
+            raise HotLoaderError(f"无法为镜像创建临时容器: {image_ref}")
+
+        source_path = self._image_model_path(normalized_model_name)
+        try:
+            try:
+                self._run_command(
+                    [
+                        self.config.docker_binary,
+                        "cp",
+                        f"{container_id}:{source_path}/.",
+                        str(model_stage_dir),
+                    ]
+                )
+            except HotLoaderError as exc:
+                raise HotLoaderError(
+                    f"镜像 {image_ref} 中未发现模型目录 {source_path}，请确认镜像结构与当前项目约定一致"
+                ) from exc
+        finally:
+            self._run_command(
+                [self.config.docker_binary, "rm", "-f", container_id],
+                allow_failure=True,
+            )
+
+        if not model_stage_dir.exists():
+            shutil.rmtree(stage_dir, ignore_errors=True)
+            raise HotLoaderError(
+                f"镜像 {image_ref} 中未发现模型目录 {source_path}，请确认镜像结构与当前项目约定一致"
+            )
+        return stage_dir, bundle_dir
 
     @staticmethod
     def _discover_models(bundle_dir: Path) -> List[str]:
@@ -1135,6 +1271,120 @@ class TritonHotLoader:
 
         result["state"] = self.get_managed_state()
         return result
+
+    def load_model_from_image(
+        self,
+        model_name: str,
+        image_ref: str,
+        *,
+        overwrite: bool = True,
+        load_after_copy: bool = True,
+    ) -> Dict[str, Any]:
+        normalized_model_name = model_name.strip()
+        normalized_image_ref = image_ref.strip()
+        if not normalized_model_name:
+            raise HotLoaderError("model_name 不能为空")
+        if not normalized_image_ref:
+            raise HotLoaderError("image 不能为空")
+
+        state = self._hydrate_state_aliases(self._load_state())
+        aliases = state.setdefault("aliases", {})
+        current_alias, current_meta = self._find_state_entry_by_model(aliases, normalized_model_name)
+        current_image = current_meta.get("image") if isinstance(current_meta, Mapping) else None
+        target_dir = self.config.model_repository / normalized_model_name
+
+        if (
+            current_image == normalized_image_ref
+            and target_dir.exists()
+            and isinstance(current_meta, Mapping)
+        ):
+            hydrated_current = self._hydrate_alias_metadata(current_meta)
+            active_versions = hydrated_current.get("active_versions", {})
+            active_version = active_versions.get(normalized_model_name) if isinstance(active_versions, dict) else None
+            return {
+                "success": True,
+                "skipped": True,
+                "alias": current_alias,
+                "image": normalized_image_ref,
+                "model_name": normalized_model_name,
+                "source_path": self._image_model_path(normalized_model_name),
+                "target_path": str(target_dir),
+                "model_versions": hydrated_current.get("model_versions", {}).get(normalized_model_name, []),
+                "active_version": active_version,
+                "load_after_copy": load_after_copy,
+                "reason": "model image unchanged",
+                "updated_at": hydrated_current.get("updated_at"),
+            }
+
+        if target_dir.exists() and not overwrite:
+            raise HotLoaderError(f"模型目录已存在，且 overwrite=false: {target_dir}")
+
+        if current_alias is not None:
+            if not overwrite:
+                raise HotLoaderError(
+                    f"模型 {normalized_model_name} 当前已由 {current_alias} 管理，且 overwrite=false"
+                )
+            self.unload_models([normalized_model_name])
+
+        stage_dir: Path | None = None
+        try:
+            stage_dir, bundle_dir = self._stage_image_model(normalized_image_ref, normalized_model_name)
+            model_versions, active_versions = self._collect_model_version_metadata(
+                bundle_dir,
+                [normalized_model_name],
+            )
+
+            backup_root = stage_dir / "_backup"
+            backup_dir = self._prepare_target_directory(
+                bundle_dir / normalized_model_name,
+                target_dir,
+                backup_root,
+            )
+            try:
+                wrote_version_policy = self._write_active_version_policy(
+                    target_dir,
+                    active_versions[normalized_model_name],
+                )
+                if load_after_copy:
+                    self._load_model(normalized_model_name)
+            except Exception as exc:
+                self._restore_backup(backup_dir, target_dir)
+                raise HotLoaderError(
+                    f"复制模型 {normalized_model_name} 后处理失败，已尝试回滚目录: {exc}"
+                ) from exc
+
+            updated_state = self._hydrate_state_aliases(self._load_state())
+            updated_aliases = updated_state.setdefault("aliases", {})
+            alias = self._bundle_key_for_model_image(normalized_model_name, normalized_image_ref)
+            updated_aliases[alias] = {
+                "image": normalized_image_ref,
+                "models": [normalized_model_name],
+                "model_versions": model_versions,
+                "active_versions": active_versions,
+                "updated_at": self._utc_now(),
+            }
+            updated_state["updated_at"] = self._utc_now()
+            self._save_state(updated_state)
+            self._cleanup_backup(backup_dir)
+
+            return {
+                "success": True,
+                "skipped": False,
+                "alias": alias,
+                "image": normalized_image_ref,
+                "model_name": normalized_model_name,
+                "source_path": self._image_model_path(normalized_model_name),
+                "target_path": str(target_dir),
+                "model_versions": model_versions[normalized_model_name],
+                "active_version": active_versions[normalized_model_name],
+                "load_after_copy": load_after_copy,
+                "loaded": load_after_copy,
+                "wrote_version_policy": wrote_version_policy,
+                "updated_at": updated_aliases[alias]["updated_at"],
+            }
+        finally:
+            if stage_dir and stage_dir.exists():
+                shutil.rmtree(stage_dir, ignore_errors=True)
 
     def _apply_alias(self, alias: str, image_ref: str) -> Dict[str, Any]:
         self._validate_alias(alias)
