@@ -1,7 +1,4 @@
-ARG DOCKER_CLI_IMAGE=docker.m.daocloud.io/docker:28-cli
 ARG PYTHON_BASE_IMAGE=docker.m.daocloud.io/library/python:3.11-slim
-
-FROM ${DOCKER_CLI_IMAGE} AS docker_cli
 
 FROM ${PYTHON_BASE_IMAGE}
 
@@ -17,8 +14,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST}
 
 WORKDIR /app
-
-COPY --from=docker_cli /usr/local/bin/docker /usr/local/bin/docker
 
 RUN set -eux; \
     if [ -f /etc/apt/sources.list.d/debian.sources ]; then \

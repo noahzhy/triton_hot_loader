@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Dict, List
 from urllib.parse import urlsplit, urlunsplit
 
 import uvicorn
@@ -17,10 +17,17 @@ TRITON_URL_OVERRIDE_HEADER = "x-hot-triton-url"
 TRITON_METRICS_PORT_OVERRIDE_HEADER = "x-hot-triton-metrics-port"
 
 
-class ApplyConfigRequest(BaseModel):
-    config: Dict[str, str]
-    prune_missing: bool = True
-    force: bool = False
+class ModelLoadRequest(BaseModel):
+    image: str = Field(min_length=1)
+    model_name: str | None = Field(default=None)
+
+
+class ModelLoadBatchRequest(BaseModel):
+    models: List[ModelLoadRequest] = Field(default_factory=list)
+
+
+class ModelActionRequest(BaseModel):
+    model_name: str = Field(min_length=1)
 
 
 class UnloadRequest(BaseModel):
@@ -31,23 +38,6 @@ class UnloadRequest(BaseModel):
 
 class ReloadRequest(BaseModel):
     models: List[str] = Field(default_factory=list)
-
-
-class LoadFromImageModelRequest(BaseModel):
-    model_name: str = Field(min_length=1)
-    image: str = Field(min_length=1)
-
-
-class LoadFromImageOptions(BaseModel):
-    load_after_copy: bool = True
-    overwrite: bool = True
-
-
-class LoadFromImageRequest(BaseModel):
-    triton_url: str | None = None
-    triton_metrics_url: str | None = None
-    models: List[LoadFromImageModelRequest] = Field(default_factory=list)
-    options: LoadFromImageOptions = Field(default_factory=LoadFromImageOptions)
 
 
 def _build_netloc_with_port(parts, port: int) -> str:
@@ -88,14 +78,14 @@ def _build_metrics_url_from_port(triton_url: str, port_text: str) -> str:
     )
 
 
-def _bytes_to_mb(value: Any) -> int | None:
+def _bytes_to_mb(value):
     if not isinstance(value, (int, float)):
         return None
     return int(round(value / (1024 * 1024)))
 
 
 def _format_runtime_gpu_status(metrics: Dict[str, object]) -> Dict[str, object]:
-    gpus: List[Dict[str, object]] = []
+    gpus = []
     for gpu in metrics.get("gpus", []):
         if not isinstance(gpu, dict):
             continue
@@ -146,36 +136,12 @@ def _get_request_loader(request: Request) -> TritonHotLoader:
     elif override_url:
         effective_metrics_url = None
 
-    override_loader = TritonHotLoader(
+    return TritonHotLoader(
         base_loader.config.with_updates(
             triton_url=effective_triton_url,
             triton_metrics_url=effective_metrics_url,
         )
     )
-    return override_loader
-
-
-def _build_loader_with_urls(
-    base_loader: TritonHotLoader,
-    *,
-    triton_url: str | None = None,
-    triton_metrics_url: str | None = None,
-) -> TritonHotLoader:
-    effective_triton_url = triton_url.strip() if isinstance(triton_url, str) else ""
-    effective_metrics_url = triton_metrics_url.strip() if isinstance(triton_metrics_url, str) else ""
-
-    if not effective_triton_url and not effective_metrics_url:
-        return base_loader
-
-    updates: Dict[str, object] = {}
-    if effective_triton_url:
-        updates["triton_url"] = effective_triton_url
-    if effective_metrics_url:
-        updates["triton_metrics_url"] = effective_metrics_url
-    elif effective_triton_url:
-        updates["triton_metrics_url"] = None
-
-    return TritonHotLoader(base_loader.config.with_updates(**updates))
 
 
 def create_app(loader: TritonHotLoader | None = None) -> FastAPI:
@@ -184,9 +150,9 @@ def create_app(loader: TritonHotLoader | None = None) -> FastAPI:
     index_file = static_dir / "index.html"
 
     app = FastAPI(
-        title="Triton Hot Loader",
-        description="UI + API for hot-loading Triton models from image bundles.",
-        version="1.0.0",
+        title="Triton Hot Loader Controller",
+        description="Kubernetes Job based Triton model loading controller.",
+        version="2.0.0",
     )
     app.state.loader = loader or TritonHotLoader(HotLoaderConfig.default())
 
@@ -216,115 +182,32 @@ def create_app(loader: TritonHotLoader | None = None) -> FastAPI:
             "detail": ready["detail"],
         }
 
-    @app.get("/api/status")
-    async def status(request: Request) -> Dict[str, object]:
-        return _get_request_loader(request).get_status()
-
-    @app.get("/api/gpu-metrics")
-    async def gpu_metrics(request: Request) -> Dict[str, object]:
-        return _get_request_loader(request).get_triton_gpu_metrics()
-
-    @app.get("/runtime/gpu-status")
-    async def runtime_gpu_status(request: Request) -> Dict[str, object]:
-        metrics = _get_request_loader(request).get_triton_gpu_metrics()
+    def _runtime_gpu_status_payload(loader: TritonHotLoader) -> Dict[str, object]:
+        metrics = loader.get_triton_gpu_metrics()
         return _format_runtime_gpu_status(metrics)
 
-    @app.get("/api/state")
-    async def state(request: Request) -> Dict[str, object]:
-        return _get_request_loader(request).get_managed_state()
-
-    @app.get("/api/models")
-    async def models(request: Request) -> Dict[str, object]:
-        loader = _get_request_loader(request)
-        return {
-            "managed": loader.get_managed_state(),
-            "triton_models": loader.list_repository_models(safe=True),
-        }
-
-    @app.get("/api/sample-config")
-    async def sample_config(request: Request) -> Dict[str, str]:
-        return _get_request_loader(request).sample_config()
-
-    @app.post("/api/apply-config")
-    async def apply_config(payload: ApplyConfigRequest, request: Request) -> Dict[str, object]:
-        return _get_request_loader(request).apply_config(
-            payload.config,
-            prune_missing=payload.prune_missing,
-            force=payload.force,
-        )
-
-    @app.post("/models/load-from-image")
-    async def load_from_image(payload: LoadFromImageRequest, request: Request) -> Dict[str, object]:
-        if not payload.models:
-            raise HotLoaderError("models 不能为空")
-
-        model_name_counts: Dict[str, int] = {}
-        for item in payload.models:
-            normalized_name = item.model_name.strip()
-            model_name_counts[normalized_name] = model_name_counts.get(normalized_name, 0) + 1
-        duplicate_models = sorted(
-            model_name for model_name, count in model_name_counts.items() if count > 1
-        )
-        if duplicate_models:
-            raise HotLoaderError(f"请求中存在重复 model_name: {', '.join(duplicate_models)}")
-
-        request_loader = _get_request_loader(request)
-        loader = _build_loader_with_urls(
-            request_loader,
-            triton_url=payload.triton_url,
-            triton_metrics_url=payload.triton_metrics_url,
-        )
-
-        result: Dict[str, object] = {
-            "success": True,
-            "triton_url": loader.config.triton_url,
-            "triton_metrics_url": loader.config.triton_metrics_url,
-            "options": payload.options.model_dump(),
-            "applied": [],
-            "skipped": [],
-            "errors": [],
-        }
-
-        applied: List[Dict[str, object]] = []
-        skipped: List[Dict[str, object]] = []
-        errors: List[Dict[str, object]] = []
-
-        for item in payload.models:
-            try:
-                operation = loader.load_model_from_image(
-                    item.model_name,
-                    item.image,
-                    overwrite=payload.options.overwrite,
-                    load_after_copy=payload.options.load_after_copy,
-                )
-            except HotLoaderError as exc:
-                result["success"] = False
-                errors.append(
-                    {
-                        "model_name": item.model_name,
-                        "image": item.image,
-                        "error": str(exc),
-                    }
-                )
-                continue
-
-            if operation.get("skipped"):
-                skipped.append(operation)
-            else:
-                applied.append(operation)
-
-        result["applied"] = applied
-        result["skipped"] = skipped
-        result["errors"] = errors
-        result["state"] = loader.get_managed_state()
+    def _load_model_sync(loader: TritonHotLoader, payload: ModelLoadRequest) -> Dict[str, object]:
+        result = loader.create_model_copy_job_and_wait(payload.model_name, payload.image)
+        if not result.get("success"):
+            raise HotLoaderError(str(result.get("detail") or result.get("status") or "模型加载失败"))
         return result
 
-    @app.post("/api/unload")
-    async def unload(payload: UnloadRequest, request: Request) -> Dict[str, object]:
+    def _load_model_batch_sync(loader: TritonHotLoader, payload: ModelLoadBatchRequest) -> Dict[str, object]:
+        if not payload.models:
+            raise HotLoaderError("models 不能为空")
+        result = loader.load_models_from_images_sync([item.model_dump(exclude_none=True) for item in payload.models])
+        if not result.get("success"):
+            error_messages = [
+                str(item.get("error") or item.get("status") or "加载失败")
+                for item in result.get("errors", [])
+                if isinstance(item, dict)
+            ]
+            raise HotLoaderError("；".join(error_messages) or "批量加载失败")
+        return result
+
+    def _unload_payload(loader: TritonHotLoader, payload: UnloadRequest) -> Dict[str, object]:
         if not payload.aliases and not payload.models and not payload.versions:
             raise HotLoaderError("请至少选择一个 alias、model 或 model@version")
-
-        loader = _get_request_loader(request)
 
         alias_result = None
         model_result = None
@@ -355,8 +238,97 @@ def create_app(loader: TritonHotLoader | None = None) -> FastAPI:
             "state": loader.get_managed_state(),
         }
 
+    @app.get("/api/status")
+    async def status(request: Request) -> Dict[str, object]:
+        return _get_request_loader(request).get_status()
+
+    @app.get("/api/models")
+    async def api_models(request: Request) -> Dict[str, object]:
+        return _get_request_loader(request).get_models_overview()
+
+    @app.get("/api/state")
+    async def api_state(request: Request) -> Dict[str, object]:
+        return _get_request_loader(request).get_managed_state()
+
+    @app.get("/api/gpu-metrics")
+    async def api_gpu_metrics(request: Request) -> Dict[str, object]:
+        return _get_request_loader(request).get_triton_gpu_metrics()
+
+    @app.get("/api/gpu-status")
+    async def api_gpu_status(request: Request) -> Dict[str, object]:
+        return _runtime_gpu_status_payload(_get_request_loader(request))
+
+    @app.get("/runtime/gpu-status")
+    async def runtime_gpu_status(request: Request) -> Dict[str, object]:
+        return _runtime_gpu_status_payload(_get_request_loader(request))
+
+    @app.post("/api/models/load")
+    async def api_load_model(payload: ModelLoadRequest, request: Request) -> Dict[str, object]:
+        return _load_model_sync(_get_request_loader(request), payload)
+
+    @app.post("/api/models/load-batch")
+    async def api_load_model_batch(payload: ModelLoadBatchRequest, request: Request) -> Dict[str, object]:
+        return _load_model_batch_sync(_get_request_loader(request), payload)
+
+    @app.get("/api/jobs/{job_name}")
+    async def api_job_status(job_name: str, request: Request) -> Dict[str, object]:
+        return _get_request_loader(request).get_job_status(job_name)
+
+    @app.post("/api/models/unload")
+    async def api_unload_model(payload: ModelActionRequest, request: Request) -> Dict[str, object]:
+        return _get_request_loader(request).unload_models([payload.model_name])
+
+    @app.post("/api/models/reload")
+    async def api_reload_model(payload: ModelActionRequest, request: Request) -> Dict[str, object]:
+        return _get_request_loader(request).reload_models([payload.model_name])
+
+    @app.post("/api/models/unload-batch")
+    async def api_unload_batch(payload: UnloadRequest, request: Request) -> Dict[str, object]:
+        return _unload_payload(_get_request_loader(request), payload)
+
+    @app.post("/models/load")
+    async def load_model(payload: ModelLoadRequest, request: Request) -> Dict[str, object]:
+        return _load_model_sync(_get_request_loader(request), payload)
+
+    @app.post("/models/load-batch")
+    async def load_model_batch(payload: ModelLoadBatchRequest, request: Request) -> Dict[str, object]:
+        return _load_model_batch_sync(_get_request_loader(request), payload)
+
+    @app.get("/models/jobs/{job_name}")
+    async def job_status(job_name: str, request: Request) -> Dict[str, object]:
+        return _get_request_loader(request).get_job_status(job_name)
+
+    @app.get("/models")
+    async def models(request: Request) -> Dict[str, object]:
+        return _get_request_loader(request).get_models_overview()
+
+    @app.post("/models/unload")
+    async def unload_model(payload: ModelActionRequest, request: Request) -> Dict[str, object]:
+        return _get_request_loader(request).unload_models([payload.model_name])
+
+    @app.post("/models/reload")
+    async def reload_model(payload: ModelActionRequest, request: Request) -> Dict[str, object]:
+        return _get_request_loader(request).reload_models([payload.model_name])
+
+    @app.get("/metrics/gpu")
+    async def gpu_metrics(request: Request) -> Dict[str, object]:
+        loader = _get_request_loader(request)
+        return {
+            "gpu": _format_runtime_gpu_status(loader.get_triton_gpu_metrics()),
+            "triton": {
+                "url": loader.config.triton_url,
+                "ready": loader.triton_ready()["ready"],
+                "models": loader.list_repository_models(safe=True),
+            },
+            "manager": loader.get_managed_state(),
+        }
+
+    @app.post("/api/unload")
+    async def unload_compat(payload: UnloadRequest, request: Request) -> Dict[str, object]:
+        return _unload_payload(_get_request_loader(request), payload)
+
     @app.post("/api/reload")
-    async def reload_models(payload: ReloadRequest, request: Request) -> Dict[str, object]:
+    async def reload_compat(payload: ReloadRequest, request: Request) -> Dict[str, object]:
         return _get_request_loader(request).reload_models(payload.models)
 
     return app

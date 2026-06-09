@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import os
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from hot_loader import HotLoaderConfig, TritonHotLoader, _default_runtime_paths
+from hot_loader import (
+    HotLoaderConfig,
+    HotLoaderError,
+    TritonHotLoader,
+    _default_runtime_paths,
+    _derive_job_volume_mount_path,
+)
 
 
 def write_model_bundle(
@@ -45,7 +51,42 @@ def write_model_bundle(
     return model_dir
 
 
-class TritonHotLoaderVersionLoadingTests(unittest.TestCase):
+class FakeBatchApi:
+    def __init__(self) -> None:
+        self.created_jobs = []
+        self.job_to_read = None
+        self.list_response = SimpleNamespace(items=[])
+
+    def list_namespaced_job(self, **kwargs):
+        return self.list_response
+
+    def create_namespaced_job(self, namespace, body):
+        self.created_jobs.append((namespace, body))
+        return SimpleNamespace(metadata=SimpleNamespace(uid="job-uid-1"))
+
+    def read_namespaced_job(self, name, namespace):
+        if self.job_to_read is None:
+            raise AssertionError("job_to_read was not configured")
+        return self.job_to_read
+
+
+class FakeCoreApi:
+    def __init__(self) -> None:
+        self.pods = []
+        self.logs = {}
+        self.events = []
+
+    def list_namespaced_pod(self, **kwargs):
+        return SimpleNamespace(items=self.pods)
+
+    def read_namespaced_pod_log(self, name, namespace, tail_lines):
+        return self.logs.get(name, "")
+
+    def list_namespaced_event(self, **kwargs):
+        return SimpleNamespace(items=self.events)
+
+
+class TritonHotLoaderKubernetesJobTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
@@ -53,156 +94,231 @@ class TritonHotLoaderVersionLoadingTests(unittest.TestCase):
         base_dir = Path(self.temp_dir.name)
         self.config = HotLoaderConfig(
             triton_url="http://127.0.0.1:8000",
-            model_repository=base_dir / "model_repository",
+            model_repository=base_dir / "repository" / "trt_models",
             state_file=base_dir / "state.json",
             staging_root=base_dir / "staging",
-        )
-        self.loader = TritonHotLoader(self.config)
-
-    def test_apply_alias_records_versions_and_uses_load_api_reload(self) -> None:
-        write_model_bundle(self.config.model_repository, "demo_model", ["1"])
-        self.loader._save_state(
-            {
-                "aliases": {
-                    "demo_alias": {
-                        "image": "registry.example.com/demo:old",
-                        "models": ["demo_model"],
-                        "model_versions": {"demo_model": ["1"]},
-                        "active_versions": {"demo_model": "1"},
-                        "updated_at": "2026-06-03T00:00:00+00:00",
-                    }
-                },
-                "updated_at": "2026-06-03T00:00:00+00:00",
-            }
-        )
-
-        stage_dir = self.config.staging_root / "apply-case"
-        bundle_dir = stage_dir / "bundle"
-        write_model_bundle(bundle_dir, "demo_model", ["2"])
-
-        events: list[tuple[str, str]] = []
-        self.loader._stage_image_bundle = lambda image_ref: (stage_dir, bundle_dir, ["demo_model"])
-        self.loader._load_model = lambda model_name: events.append(("load", model_name))
-        self.loader._unload_model = lambda model_name, tolerate_missing=True: events.append(("unload", model_name))
-
-        result = self.loader._apply_alias("demo_alias", "registry.example.com/demo:new")
-        state = self.loader.get_managed_state()
-        alias_meta = state["aliases"]["demo_alias"]
-        config_text = (self.config.model_repository / "demo_model" / "config.pbtxt").read_text(
-            encoding="utf-8"
-        )
-
-        self.assertEqual(events, [("load", "demo_model")])
-        self.assertEqual(result["model_versions"], {"demo_model": ["2"]})
-        self.assertEqual(result["active_versions"], {"demo_model": "2"})
-        self.assertEqual(result["version_policy_models"], ["demo_model"])
-        self.assertEqual(alias_meta["model_versions"], {"demo_model": ["2"]})
-        self.assertEqual(alias_meta["active_versions"], {"demo_model": "2"})
-        self.assertIn("version_policy:", config_text)
-        self.assertIn("versions: [ 2 ]", config_text)
-        self.assertNotIn("versions: [ 1 ]", config_text)
-
-    def test_stage_image_model_uses_project_image_root_plus_model_name(self) -> None:
-        commands: list[list[str]] = []
-
-        def fake_pull_image(image_ref: str) -> None:
-            commands.append(["docker", "pull", image_ref])
-
-        def fake_run_command(args, *, allow_failure: bool = False):
-            commands.append(list(args))
-            if args[:2] == ["docker", "create"]:
-                return subprocess.CompletedProcess(args, 0, stdout="container-123\n", stderr="")
-            if args[:2] == ["docker", "cp"]:
-                target_dir = Path(args[-1])
-                target_dir.mkdir(parents=True, exist_ok=True)
-                (target_dir / "config.pbtxt").write_text('name: "demo_model"\n', encoding="utf-8")
-                version_dir = target_dir / "1"
-                version_dir.mkdir(parents=True, exist_ok=True)
-                (version_dir / "model.onnx").write_text("fake\n", encoding="utf-8")
-                return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
-            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
-
-        self.loader._pull_image = fake_pull_image  # type: ignore[method-assign]
-        self.loader._run_command = fake_run_command  # type: ignore[method-assign]
-
-        stage_dir, bundle_dir = self.loader._stage_image_model(
-            "registry.example.com/demo:v1",
-            "demo_model",
-        )
-
-        self.assertEqual(
-            commands[2],
-            [
-                "docker",
-                "cp",
-                "container-123:/trt_models/demo_model/.",
-                str(bundle_dir / "demo_model"),
+            model_source_path="/trt_models",
+            model_target_path="/repository/trt_models",
+            triton_repository_pvc="triton-repository-pvc",
+            k8s_namespace="default",
+            model_image_registry_prefix="ccr.ccs.tencentyun.com/clobotics/",
+            job_tolerations=[
+                {"key": "gpu", "operator": "Exists", "effect": "NoSchedule"},
+                {"key": "cpu", "operator": "Equal", "value": "cveng", "effect": "NoSchedule"},
             ],
         )
-        self.assertTrue((bundle_dir / "demo_model" / "config.pbtxt").exists())
-        self.assertTrue((bundle_dir / "demo_model" / "1" / "model.onnx").exists())
-        self.assertTrue(stage_dir.exists())
+        self.loader = TritonHotLoader(self.config)
+        self.batch_api = FakeBatchApi()
+        self.core_api = FakeCoreApi()
+        self.loader._get_batch_v1_api = lambda: self.batch_api  # type: ignore[method-assign]
+        self.loader._get_core_v1_api = lambda: self.core_api  # type: ignore[method-assign]
 
-    def test_validate_config_map_ignores_json_keys_and_skips_mlman_config(self) -> None:
-        normalized = self.loader._validate_config_map(
-            {
-                "whatever": "registry.example.com/team/unit-model:v1",
-                "mlman_config": "ccr.ccs.tencentyun.com/clobotics/mlmanconfig-init:hpc_us-20260529_1",
-                "another_placeholder": "registry.example.com/team/sku-model:v2",
-            }
+    def test_create_model_copy_job_builds_kubernetes_manifest_and_records_state(self) -> None:
+        result = self.loader.create_model_copy_job(
+            "unit_empty_space_uspg_yolov8",
+            "ccr.ccs.tencentyun.com/clobotics/unit-model-init:20260605",
         )
 
-        self.assertEqual(
-            normalized,
-            {
-                "registry.example.com/team/unit-model:v1": "registry.example.com/team/unit-model:v1",
-                "registry.example.com/team/sku-model:v2": "registry.example.com/team/sku-model:v2",
-            },
-        )
-
-    def test_apply_config_matches_existing_entry_by_image_not_json_key(self) -> None:
-        self.loader._save_state(
-            {
-                "aliases": {
-                    "legacy_alias": {
-                        "image": "registry.example.com/team/unit-model:v1",
-                        "models": ["unit_model"],
-                        "model_versions": {"unit_model": ["1"]},
-                        "active_versions": {"unit_model": "1"},
-                        "updated_at": "2026-06-03T00:00:00+00:00",
-                    }
-                },
-                "updated_at": "2026-06-03T00:00:00+00:00",
-            }
-        )
-
-        calls: list[tuple[str, str]] = []
-
-        def fail_if_called(bundle_id: str, image_ref: str) -> dict[str, str]:
-            calls.append((bundle_id, image_ref))
-            raise AssertionError("_apply_alias should not be called for unchanged image")
-
-        self.loader._apply_alias = fail_if_called  # type: ignore[method-assign]
-
-        result = self.loader.apply_config(
-            {
-                "renamed_json_key": "registry.example.com/team/unit-model:v1",
-            },
-            prune_missing=False,
-            force=False,
-        )
-
-        self.assertEqual(calls, [])
         self.assertTrue(result["success"])
-        self.assertEqual(result["requested_images"], ["registry.example.com/team/unit-model:v1"])
-        self.assertEqual(len(result["skipped"]), 1)
-        self.assertEqual(result["skipped"][0]["bundle_id"], "legacy_alias")
-        self.assertEqual(result["skipped"][0]["image"], "registry.example.com/team/unit-model:v1")
+        self.assertEqual(result["status"], "JOB_CREATED")
+        namespace, manifest = self.batch_api.created_jobs[0]
+        self.assertEqual(namespace, "default")
+        container = manifest["spec"]["template"]["spec"]["containers"][0]
+        self.assertEqual(container["image"], "ccr.ccs.tencentyun.com/clobotics/unit-model-init:20260605")
+        self.assertEqual(container["env"][1]["value"], "/trt_models")
+        self.assertEqual(container["env"][2]["value"], "/repository/trt_models")
+        self.assertIn('SOURCE_DIR="${MODEL_SOURCE_PATH%/}/${MODEL_NAME}"', container["args"][0])
+        self.assertIn('cp -R "${COPY_SOURCE}/." "${TARGET_DIR}/"', container["args"][0])
+        self.assertEqual(container["volumeMounts"][0]["mountPath"], "/repository")
+        self.assertEqual(
+            manifest["spec"]["template"]["spec"]["tolerations"],
+            [
+                {"key": "gpu", "operator": "Exists", "effect": "NoSchedule"},
+                {"key": "cpu", "operator": "Equal", "value": "cveng", "effect": "NoSchedule"},
+            ],
+        )
+        self.assertEqual(
+            manifest["spec"]["template"]["spec"]["volumes"][0]["persistentVolumeClaim"]["claimName"],
+            "triton-repository-pvc",
+        )
+
+        state = self.loader.get_managed_state()
+        self.assertIn(result["job_name"], state["jobs"])
+        self.assertEqual(state["jobs"][result["job_name"]]["model_name"], "unit_empty_space_uspg_yolov8")
+
+    def test_create_model_copy_job_derives_model_name_from_image_tag(self) -> None:
+        result = self.loader.create_model_copy_job(
+            "",
+            "ccr.ccs.tencentyun.com/clobotics/unit-model-init:unit_empty_space_uspg_yolov8-20260430",
+        )
+
+        self.assertEqual(result["model_name"], "unit_empty_space_uspg_yolov8")
+        _, manifest = self.batch_api.created_jobs[0]
+        container = manifest["spec"]["template"]["spec"]["containers"][0]
+        self.assertEqual(container["env"][0]["value"], "unit_empty_space_uspg_yolov8")
+
+    def test_derive_model_name_from_image_tag_normalizes_dash(self) -> None:
+        derived = self.loader._derive_model_name_from_image_ref(
+            "ccr.ccs.tencentyun.com/clobotics/unit-model-init:model-a"
+        )
+
+        self.assertEqual(derived, "model_a")
+
+    def test_create_model_copy_job_rejects_unapproved_registry(self) -> None:
+        with self.assertRaisesRegex(HotLoaderError, "registry 前缀"):
+            self.loader.create_model_copy_job("demo_model", "registry.example.com/demo:1")
+
+    def test_load_models_from_images_sync_derives_model_name_when_missing(self) -> None:
+        captured = {}
+
+        def fake_create_model_copy_job_and_wait(model_name, image_ref, **kwargs):
+            captured["model_name"] = model_name
+            captured["image"] = image_ref
+            return {"success": True, "job_name": "job-a", "model_name": model_name, "status": "MODEL_READY"}
+
+        self.loader.create_model_copy_job_and_wait = fake_create_model_copy_job_and_wait  # type: ignore[method-assign]
+
+        result = self.loader.load_models_from_images_sync(
+            [
+                {
+                    "image": "ccr.ccs.tencentyun.com/clobotics/unit-model-init:model-a",
+                }
+            ]
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(captured["model_name"], "model_a")
+        self.assertEqual(result["completed"][0]["model_name"], "model_a")
+
+    def test_wait_for_job_terminal_state_polls_until_model_ready(self) -> None:
+        responses = iter(
+            [
+                {"job_name": "model-copy-demo", "status": "JOB_CREATED", "detail": "created"},
+                {"job_name": "model-copy-demo", "status": "COPY_RUNNING", "detail": "copying"},
+                {"job_name": "model-copy-demo", "status": "MODEL_READY", "detail": "ready"},
+            ]
+        )
+        self.loader.get_job_status = lambda job_name: next(responses)  # type: ignore[method-assign]
+
+        with patch("hot_loader.time.sleep", return_value=None) as sleep_mock:
+            result = self.loader.wait_for_job_terminal_state(
+                "model-copy-demo",
+                timeout_seconds=5,
+                poll_interval_seconds=0,
+            )
+
+        self.assertEqual(result["status"], "MODEL_READY")
+        self.assertEqual(sleep_mock.call_count, 2)
+
+    def test_get_job_status_marks_image_pull_failure(self) -> None:
+        self.batch_api.job_to_read = SimpleNamespace(
+            metadata=SimpleNamespace(
+                annotations={
+                    "hot-loader/model-name": "demo_model",
+                    "hot-loader/image-ref": "ccr.ccs.tencentyun.com/clobotics/demo:1",
+                }
+            ),
+            status=SimpleNamespace(active=0, failed=0, succeeded=0),
+        )
+        self.core_api.pods = [
+            SimpleNamespace(
+                metadata=SimpleNamespace(name="demo-pod"),
+                status=SimpleNamespace(
+                    phase="Pending",
+                    container_statuses=[
+                        SimpleNamespace(
+                            state=SimpleNamespace(
+                                waiting=SimpleNamespace(
+                                    reason="ImagePullBackOff",
+                                    message="Back-off pulling image",
+                                )
+                            )
+                        )
+                    ],
+                ),
+            )
+        ]
+
+        result = self.loader.get_job_status("model-copy-demo")
+
+        self.assertEqual(result["status"], "COPY_FAILED")
+        self.assertIn("镜像拉取失败", result["detail"])
+        self.assertEqual(result["pod_name"], "demo-pod")
+
+    def test_get_job_status_marks_unschedulable_pod_as_scheduling(self) -> None:
+        self.batch_api.job_to_read = SimpleNamespace(
+            metadata=SimpleNamespace(
+                annotations={
+                    "hot-loader/model-name": "demo_model",
+                    "hot-loader/image-ref": "ccr.ccs.tencentyun.com/clobotics/demo:1",
+                }
+            ),
+            status=SimpleNamespace(active=0, failed=0, succeeded=0),
+        )
+        self.core_api.pods = [
+            SimpleNamespace(
+                metadata=SimpleNamespace(name="demo-pod"),
+                status=SimpleNamespace(
+                    phase="Pending",
+                    container_statuses=[],
+                    conditions=[
+                        SimpleNamespace(
+                            type="PodScheduled",
+                            status="False",
+                            reason="Unschedulable",
+                            message="0/4 nodes are available: 4 Insufficient cpu.",
+                        )
+                    ],
+                ),
+            )
+        ]
+        self.core_api.events = [
+            SimpleNamespace(
+                type="Warning",
+                reason="FailedScheduling",
+                message="0/4 nodes are available: 4 Insufficient cpu.",
+                count=8,
+            )
+        ]
+
+        result = self.loader.get_job_status("model-copy-demo")
+
+        self.assertEqual(result["status"], "SCHEDULING")
+        self.assertIn("Insufficient cpu", result["detail"])
+        self.assertEqual(result["events"][0]["reason"], "FailedScheduling")
+
+    def test_get_job_status_finalizes_triton_load_after_copy_success(self) -> None:
+        write_model_bundle(self.config.model_repository, "demo_model", ["2"])
+        self.batch_api.job_to_read = SimpleNamespace(
+            metadata=SimpleNamespace(
+                annotations={
+                    "hot-loader/model-name": "demo_model",
+                    "hot-loader/image-ref": "ccr.ccs.tencentyun.com/clobotics/demo:2",
+                }
+            ),
+            status=SimpleNamespace(active=0, failed=0, succeeded=1),
+        )
+        self.core_api.pods = [SimpleNamespace(metadata=SimpleNamespace(name="demo-pod"), status=SimpleNamespace(phase="Succeeded"))]
+        self.core_api.logs = {"demo-pod": "model copy done"}
+
+        events = []
+        self.loader._load_model = lambda model_name: events.append(model_name)  # type: ignore[method-assign]
+        self.loader.list_repository_models = lambda safe=True: [  # type: ignore[method-assign]
+            {"name": "demo_model", "version": "2", "state": "READY", "reason": ""}
+        ]
+
+        result = self.loader.get_job_status("model-copy-demo")
+        state = self.loader.get_managed_state()
+
+        self.assertEqual(events, ["demo_model"])
+        self.assertEqual(result["status"], "MODEL_READY")
+        self.assertIn("model copy done", result["logs"])
+        self.assertTrue(any(item["image"] == "ccr.ccs.tencentyun.com/clobotics/demo:2" for item in state["managed_images"]))
 
     def test_reload_models_uses_load_only(self) -> None:
-        events: list[tuple[str, str]] = []
-        self.loader._load_model = lambda model_name: events.append(("load", model_name))
-        self.loader._unload_model = lambda model_name, tolerate_missing=True: events.append(("unload", model_name))
+        events = []
+        self.loader._load_model = lambda model_name: events.append(("load", model_name))  # type: ignore[method-assign]
+        self.loader._unload_model = lambda model_name, tolerate_missing=True: events.append(("unload", model_name))  # type: ignore[method-assign]
 
         result = self.loader.reload_models(["demo_model", "demo_model"])
 
@@ -215,238 +331,62 @@ class TritonHotLoaderVersionLoadingTests(unittest.TestCase):
             {
                 "aliases": {
                     "demo_alias": {
-                        "image": "registry.example.com/demo:multi",
+                        "image": "ccr.ccs.tencentyun.com/clobotics/demo:multi",
                         "models": ["demo_model"],
                         "model_versions": {"demo_model": ["1", "2", "3"]},
                         "active_versions": {"demo_model": "3"},
                         "updated_at": "2026-06-03T00:00:00+00:00",
                     }
                 },
+                "jobs": {},
                 "updated_at": "2026-06-03T00:00:00+00:00",
             }
         )
 
-        events: list[tuple[str, str]] = []
-        self.loader._load_model = lambda model_name: events.append(("load", model_name))
-        self.loader._unload_model = lambda model_name, tolerate_missing=True: events.append(("unload", model_name))
+        events = []
+        self.loader._load_model = lambda model_name: events.append(("load", model_name))  # type: ignore[method-assign]
+        self.loader._unload_model = lambda model_name, tolerate_missing=True: events.append(("unload", model_name))  # type: ignore[method-assign]
 
         result = self.loader.unload_model_versions(["demo_model@3"])
         state = self.loader.get_managed_state()
-        alias_meta = state["aliases"]["demo_alias"]
-        config_text = (self.config.model_repository / "demo_model" / "config.pbtxt").read_text(
-            encoding="utf-8"
-        )
 
         self.assertEqual(events, [("load", "demo_model")])
-        self.assertEqual(alias_meta["model_versions"], {"demo_model": ["1", "2"]})
-        self.assertEqual(alias_meta["active_versions"], {"demo_model": "2"})
-        self.assertTrue((self.config.model_repository / "demo_model" / "1").exists())
-        self.assertTrue((self.config.model_repository / "demo_model" / "2").exists())
-        self.assertFalse((self.config.model_repository / "demo_model" / "3").exists())
-        self.assertIn("versions: [ 2 ]", config_text)
-        self.assertEqual(result["removed_versions"][0]["removed_versions"], ["3"])
+        self.assertEqual(state["managed_active_versions"], {"demo_model": "2"})
         self.assertEqual(result["removed_versions"][0]["remaining_versions"], ["1", "2"])
-        self.assertEqual(result["switched_active_versions"], [{"model": "demo_model", "from": "3", "to": "2"}])
-
-    def test_unload_model_versions_removes_last_version_and_alias(self) -> None:
-        write_model_bundle(self.config.model_repository, "solo_model", ["7"])
-        self.loader._save_state(
-            {
-                "aliases": {
-                    "solo_alias": {
-                        "image": "registry.example.com/solo:7",
-                        "models": ["solo_model"],
-                        "model_versions": {"solo_model": ["7"]},
-                        "active_versions": {"solo_model": "7"},
-                        "updated_at": "2026-06-03T00:00:00+00:00",
-                    }
-                },
-                "updated_at": "2026-06-03T00:00:00+00:00",
-            }
-        )
-
-        events: list[tuple[str, str]] = []
-        self.loader._load_model = lambda model_name: events.append(("load", model_name))
-        self.loader._unload_model = lambda model_name, tolerate_missing=True: events.append(("unload", model_name))
-
-        result = self.loader.unload_model_versions(["solo_model@7"])
-        state = self.loader.get_managed_state()
-
-        self.assertEqual(events, [("unload", "solo_model")])
-        self.assertFalse((self.config.model_repository / "solo_model").exists())
-        self.assertNotIn("solo_alias", state["aliases"])
-        self.assertEqual(result["removed_models"], ["solo_model"])
-        self.assertEqual(result["deleted_aliases"], ["solo_alias"])
-        self.assertTrue(result["removed_versions"][0]["unloaded_model"])
-
-    def test_get_managed_state_backfills_versions_for_legacy_state(self) -> None:
-        write_model_bundle(self.config.model_repository, "legacy_model", ["20260530"])
-        self.loader._save_state(
-            {
-                "aliases": {
-                    "legacy_alias": {
-                        "image": "registry.example.com/legacy:20260530",
-                        "models": ["legacy_model"],
-                        "updated_at": "2026-06-03T00:00:00+00:00",
-                    }
-                },
-                "updated_at": "2026-06-03T00:00:00+00:00",
-            }
-        )
-
-        state = self.loader.get_managed_state()
-        alias_meta = state["aliases"]["legacy_alias"]
-
-        self.assertEqual(alias_meta["model_versions"], {"legacy_model": ["20260530"]})
-        self.assertEqual(alias_meta["active_versions"], {"legacy_model": "20260530"})
-        self.assertEqual(state["managed_model_versions"], {"legacy_model": ["20260530"]})
-        self.assertEqual(state["managed_active_versions"], {"legacy_model": "20260530"})
-
-    def test_load_model_from_image_replaces_existing_model_and_updates_state(self) -> None:
-        write_model_bundle(self.config.model_repository, "demo_model", ["1"])
-        self.loader._save_state(
-            {
-                "aliases": {
-                    "legacy_alias": {
-                        "image": "registry.example.com/demo:old",
-                        "models": ["demo_model"],
-                        "model_versions": {"demo_model": ["1"]},
-                        "active_versions": {"demo_model": "1"},
-                        "updated_at": "2026-06-03T00:00:00+00:00",
-                    }
-                },
-                "updated_at": "2026-06-03T00:00:00+00:00",
-            }
-        )
-
-        stage_dir = self.config.staging_root / "load-from-image"
-        bundle_dir = stage_dir / "bundle"
-        write_model_bundle(bundle_dir, "demo_model", ["2"])
-
-        events: list[tuple[str, str]] = []
-        self.loader._stage_image_model = lambda image_ref, model_name: (stage_dir, bundle_dir)  # type: ignore[method-assign]
-        self.loader._unload_model = lambda model_name, tolerate_missing=True: events.append(("unload", model_name))
-        self.loader._load_model = lambda model_name: events.append(("load", model_name))
-
-        result = self.loader.load_model_from_image(
-            "demo_model",
-            "registry.example.com/demo:new",
-        )
-        state = self.loader.get_managed_state()
-        new_alias = result["alias"]
-        new_meta = state["aliases"][new_alias]
-
-        self.assertEqual(events, [("unload", "demo_model"), ("load", "demo_model")])
-        self.assertNotIn("legacy_alias", state["aliases"])
-        self.assertEqual(new_meta["image"], "registry.example.com/demo:new")
-        self.assertEqual(new_meta["models"], ["demo_model"])
-        self.assertEqual(new_meta["model_versions"], {"demo_model": ["2"]})
-        self.assertEqual(new_meta["active_versions"], {"demo_model": "2"})
-        self.assertFalse((self.config.model_repository / "demo_model" / "1").exists())
-        self.assertTrue((self.config.model_repository / "demo_model" / "2" / "model.onnx").exists())
-
-    def test_write_active_version_policy_replaces_existing_policy(self) -> None:
-        model_dir = write_model_bundle(
-            self.config.model_repository,
-            "policy_model",
-            ["5", "7"],
-            include_version_policy=True,
-        )
-
-        updated = self.loader._write_active_version_policy(model_dir, "7")
-        config_text = (model_dir / "config.pbtxt").read_text(encoding="utf-8")
-
-        self.assertTrue(updated)
-        self.assertEqual(config_text.count("version_policy:"), 1)
-        self.assertIn("versions: [ 7 ]", config_text)
-        self.assertNotIn("num_versions: 2", config_text)
-
-    def test_get_triton_gpu_metrics_auto_detects_port_plus_two(self) -> None:
-        metrics_text = """
-# HELP nv_gpu_utilization GPU utilization rate [0.0 - 1.0)
-# TYPE nv_gpu_utilization gauge
-nv_gpu_utilization{gpu_uuid="GPU-aaa"} 0.25
-nv_gpu_utilization{gpu_uuid="GPU-bbb"} 0.5
-# HELP nv_gpu_memory_total_bytes GPU total memory, in bytes
-# TYPE nv_gpu_memory_total_bytes gauge
-nv_gpu_memory_total_bytes{gpu_uuid="GPU-aaa"} 100
-nv_gpu_memory_total_bytes{gpu_uuid="GPU-bbb"} 200
-# HELP nv_gpu_memory_used_bytes GPU used memory, in bytes
-# TYPE nv_gpu_memory_used_bytes gauge
-nv_gpu_memory_used_bytes{gpu_uuid="GPU-aaa"} 40
-nv_gpu_memory_used_bytes{gpu_uuid="GPU-bbb"} 60
-# HELP nv_gpu_power_usage GPU power usage in watts
-# TYPE nv_gpu_power_usage gauge
-nv_gpu_power_usage{gpu_uuid="GPU-aaa"} 50
-nv_gpu_power_usage{gpu_uuid="GPU-bbb"} 75
-""".strip()
-
-        class FakeResponse:
-            def __init__(self, status_code: int, text: str) -> None:
-                self.status_code = status_code
-                self.text = text
-
-            @property
-            def is_error(self) -> bool:
-                return self.status_code >= 400
-
-        with patch(
-            "hot_loader.httpx.get",
-            side_effect=[
-                FakeResponse(404, "not found"),
-                FakeResponse(200, metrics_text),
-            ],
-        ):
-            metrics = self.loader.get_triton_gpu_metrics()
-
-        self.assertTrue(metrics["available"])
-        self.assertEqual(metrics["url"], "http://127.0.0.1:8002/metrics")
-        self.assertEqual(metrics["summary"]["device_count"], 2)
-        self.assertEqual(metrics["summary"]["used_bytes"], 100)
-        self.assertEqual(metrics["summary"]["total_bytes"], 300)
-        self.assertAlmostEqual(metrics["summary"]["used_ratio"], 1 / 3)
-        self.assertAlmostEqual(metrics["summary"]["average_utilization_ratio"], 0.375)
-        self.assertEqual(metrics["summary"]["total_power_usage_watts"], 125)
-        self.assertEqual(
-            metrics["gpus"],
-            [
-                {
-                    "index": 0,
-                    "label": "GPU 0",
-                    "gpu_uuid": "GPU-aaa",
-                    "gpu_bus_id": None,
-                    "used_bytes": 40,
-                    "total_bytes": 100,
-                    "used_ratio": 0.4,
-                    "used_percent": 40.0,
-                    "utilization_ratio": 0.25,
-                    "utilization_percent": 25.0,
-                    "power_usage_watts": 50.0,
-                },
-                {
-                    "index": 1,
-                    "label": "GPU 1",
-                    "gpu_uuid": "GPU-bbb",
-                    "gpu_bus_id": None,
-                    "used_bytes": 60,
-                    "total_bytes": 200,
-                    "used_ratio": 0.3,
-                    "used_percent": 30.0,
-                    "utilization_ratio": 0.5,
-                    "utilization_percent": 50.0,
-                    "power_usage_watts": 75.0,
-                },
-            ],
-        )
 
 
 class HotLoaderDefaultRuntimePathTests(unittest.TestCase):
-    def test_default_runtime_paths_use_env_controlled_repository_path(self) -> None:
+    def test_derive_job_volume_mount_path_uses_parent_for_nested_target_path(self) -> None:
+        self.assertEqual(_derive_job_volume_mount_path("/repository/trt_models"), "/repository")
+
+    def test_derive_job_volume_mount_path_keeps_top_level_target_path(self) -> None:
+        self.assertEqual(_derive_job_volume_mount_path("/repository"), "/repository")
+
+    def test_default_runtime_paths_prefer_hot_triton_repository_override(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base_dir = Path(temp_dir) / "runtime"
             repository_path = Path(temp_dir) / "repository"
 
             with patch.dict(os.environ, {"HOT_TRITON_MODEL_REPOSITORY": str(repository_path)}, clear=False):
+                model_repository, state_file, staging_root = _default_runtime_paths(base_dir)
+
+        self.assertEqual(model_repository, repository_path)
+        self.assertEqual(state_file, repository_path / ".hot_loader" / "state.json")
+        self.assertEqual(staging_root, repository_path / ".staging")
+
+    def test_default_runtime_paths_fall_back_to_model_target_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir) / "runtime"
+            repository_path = Path(temp_dir) / "repository"
+
+            with patch.dict(
+                os.environ,
+                {
+                    "MODEL_TARGET_PATH": str(repository_path),
+                    "HOT_TRITON_MODEL_REPOSITORY": "",
+                },
+                clear=False,
+            ):
                 model_repository, state_file, staging_root = _default_runtime_paths(base_dir)
 
         self.assertEqual(model_repository, repository_path)
@@ -462,51 +402,26 @@ class HotLoaderDefaultRuntimePathTests(unittest.TestCase):
         self.assertEqual(state_file, base_dir / "state.json")
         self.assertEqual(staging_root, base_dir / "staging")
 
-    def test_default_config_reads_triton_url_from_environment(self) -> None:
+    def test_default_config_reads_job_tolerations_from_environment(self) -> None:
         with patch("hot_loader._load_dotenv_values", return_value={}), patch.dict(
             "os.environ",
             {
-                "HOT_TRITON_TRITON_URL": "http://10.0.0.8:19000",
-                "HOT_TRITON_TRITON_METRICS_URL": "http://10.0.0.8:19002/metrics",
+                "JOB_TOLERATIONS_JSON": (
+                    '[{"key":"gpu","operator":"Exists","effect":"NoSchedule"},'
+                    '{"key":"cpu","operator":"Equal","value":"cveng","effect":"NoSchedule"}]'
+                )
             },
             clear=True,
         ):
             config = HotLoaderConfig.default()
 
-        self.assertEqual(config.triton_url, "http://10.0.0.8:19000")
-        self.assertEqual(config.triton_metrics_url, "http://10.0.0.8:19002/metrics")
-
-    def test_default_config_prefers_trt_ip_and_ports_from_environment(self) -> None:
-        with patch("hot_loader._load_dotenv_values", return_value={}), patch.dict(
-            "os.environ",
-            {
-                "TRT_IP": "127.0.0.1",
-                "HTTP_PORT": "8000",
-                "METRICS_PORT": "8002",
-                "HOT_TRITON_TRITON_URL": "http://10.0.0.8:19000",
-                "HOT_TRITON_TRITON_METRICS_URL": "http://10.0.0.8:19002/metrics",
-            },
-            clear=True,
-        ):
-            config = HotLoaderConfig.default()
-
-        self.assertEqual(config.triton_url, "http://127.0.0.1:8000")
-        self.assertEqual(config.triton_metrics_url, "http://127.0.0.1:8002/metrics")
-
-    def test_default_config_supports_trt_ip_with_embedded_port_by_taking_host_only(self) -> None:
-        with patch("hot_loader._load_dotenv_values", return_value={}), patch.dict(
-            "os.environ",
-            {
-                "TRT_IP": "10.2.20.6:30649",
-                "HTTP_PORT": "31648",
-                "METRICS_PORT": "31589",
-            },
-            clear=True,
-        ):
-            config = HotLoaderConfig.default()
-
-        self.assertEqual(config.triton_url, "http://10.2.20.6:31648")
-        self.assertEqual(config.triton_metrics_url, "http://10.2.20.6:31589/metrics")
+        self.assertEqual(
+            config.job_tolerations,
+            [
+                {"key": "gpu", "operator": "Exists", "effect": "NoSchedule"},
+                {"key": "cpu", "operator": "Equal", "value": "cveng", "effect": "NoSchedule"},
+            ],
+        )
 
 
 if __name__ == "__main__":

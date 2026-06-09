@@ -15,11 +15,7 @@ fi
 NETWORK_MODE="${NETWORK_MODE:-${DEFAULT_NETWORK_MODE}}"
 ENV_FILE="${ENV_FILE:-${SCRIPT_DIR}/.env}"
 RUNTIME_DIR="${RUNTIME_DIR:-${SCRIPT_DIR}/runtime}"
-DOCKER_SOCKET="${DOCKER_SOCKET:-/var/run/docker.sock}"
 RESTART_POLICY="${RESTART_POLICY:-unless-stopped}"
-HOST_DOCKER_CONFIG_DIR="${HOST_DOCKER_CONFIG_DIR:-${DOCKER_CONFIG:-$HOME/.docker}}"
-CONTAINER_DOCKER_CONFIG_DIR="/root/.docker"
-GENERATED_DOCKER_CONFIG_DIR=""
 
 if [[ $# -gt 0 ]] && [[ "${1}" != -* ]]; then
   IMAGE_REF="${1}"
@@ -27,80 +23,6 @@ if [[ $# -gt 0 ]] && [[ "${1}" != -* ]]; then
 fi
 
 mkdir -p "${RUNTIME_DIR}/model_repository" "${RUNTIME_DIR}/staging"
-
-if [[ -f "${HOST_DOCKER_CONFIG_DIR}/config.json" ]]; then
-  GENERATED_DOCKER_CONFIG_DIR="${RUNTIME_DIR}/docker-config"
-  mkdir -p "${GENERATED_DOCKER_CONFIG_DIR}"
-  export HOST_DOCKER_CONFIG_DIR
-  export GENERATED_DOCKER_CONFIG_DIR
-  python3 <<'PY'
-import base64
-import json
-import os
-import shutil
-import subprocess
-from pathlib import Path
-
-host_config_dir = Path(os.environ["HOST_DOCKER_CONFIG_DIR"])
-output_path = Path(os.environ["GENERATED_DOCKER_CONFIG_DIR"]) / "config.json"
-config = json.loads((host_config_dir / "config.json").read_text())
-
-result = {"auths": {}}
-
-for registry, auth_cfg in config.get("auths", {}).items():
-    auth_value = auth_cfg.get("auth")
-    if auth_value:
-        result["auths"][registry] = {"auth": auth_value}
-
-def resolve_with_helper(helper_name: str, registry: str):
-    helper_bin = shutil.which(f"docker-credential-{helper_name}")
-    if not helper_bin:
-        return None
-
-    proc = subprocess.run(
-        [helper_bin, "get"],
-        input=registry.encode(),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    if proc.returncode != 0:
-        return None
-
-    payload = json.loads(proc.stdout)
-    username = payload.get("Username")
-    secret = payload.get("Secret")
-    if not username or not secret:
-        return None
-
-    token = base64.b64encode(f"{username}:{secret}".encode()).decode()
-    return {"auth": token}
-
-cred_helpers = config.get("credHelpers", {})
-default_store = config.get("credsStore")
-
-registries = set(config.get("auths", {}).keys()) | set(cred_helpers.keys())
-for registry in registries:
-    if registry in result["auths"]:
-        continue
-
-    helper_name = cred_helpers.get(registry, default_store)
-    if not helper_name:
-        continue
-
-    resolved = resolve_with_helper(helper_name, registry)
-    if resolved:
-        result["auths"][registry] = resolved
-
-output_path.write_text(json.dumps(result, indent=2))
-PY
-fi
-
-if [[ ! -S "${DOCKER_SOCKET}" ]]; then
-  echo "[hot_triton] Docker socket 不存在: ${DOCKER_SOCKET}" >&2
-  echo "[hot_triton] 请确认宿主机 Docker 已启动，并且 socket 已挂载。" >&2
-  exit 1
-fi
 
 if [[ -f "${ENV_FILE}" ]]; then
   echo "[hot_triton] env file: ${ENV_FILE}"
@@ -118,14 +40,7 @@ docker_args=(
   --name "${CONTAINER_NAME}"
   --restart "${RESTART_POLICY}"
   -v "${RUNTIME_DIR}:/app/runtime"
-  -v "${DOCKER_SOCKET}:/var/run/docker.sock"
 )
-
-if [[ -n "${GENERATED_DOCKER_CONFIG_DIR}" && -f "${GENERATED_DOCKER_CONFIG_DIR}/config.json" ]]; then
-  docker_args+=(
-    -v "${GENERATED_DOCKER_CONFIG_DIR}:${CONTAINER_DOCKER_CONFIG_DIR}:ro"
-  )
-fi
 
 if [[ -f "${ENV_FILE}" ]]; then
   docker_args+=(
@@ -138,7 +53,6 @@ case "${NETWORK_MODE}" in
   host)
     docker_args+=(--network host)
     ACCESS_URL="http://127.0.0.1:${APP_PORT}"
-    echo "[hot_triton] using host network，容器内的 127.0.0.1 会直接指向宿主机。"
     ;;
   bridge)
     docker_args+=(
@@ -146,9 +60,6 @@ case "${NETWORK_MODE}" in
       -p "${APP_PORT}:${APP_PORT}"
     )
     ACCESS_URL="http://127.0.0.1:${APP_PORT}"
-    if [[ -f "${ENV_FILE}" ]] && grep -Eq '^\s*TRT_IP\s*=\s*127\.0\.0\.1\s*$' "${ENV_FILE}"; then
-      echo "[hot_triton] warning: bridge 网络下容器内的 127.0.0.1 指向容器自身；如果 Triton 跑在宿主机，请把 TRT_IP 改成 host.docker.internal，或继续使用 NETWORK_MODE=host。" >&2
-    fi
     ;;
   *)
     docker_args+=(

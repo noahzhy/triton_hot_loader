@@ -1,0 +1,150 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trtis-deployment-realtime-dev
+  namespace: default
+  labels:
+    base: realtime
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: trtis
+      base: realtime
+  strategy:
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: trtis
+        base: realtime
+    spec:
+      serviceAccountName: triton-controller-sa
+      affinity: {}
+      containers:
+        - name: trtis
+          image: ccr.ccs.tencentyun.com/clobotics/tritonserver:24.12-py3
+          imagePullPolicy: IfNotPresent
+          command:
+            - tritonserver
+            - --model-store=/repository/trt_models
+            - --strict-model-config=false
+            - --log-verbose=0
+            - --backend-config=default-max-batch-size=4
+            - --model-control-mode=explicit
+            - --repository-poll-secs=0
+            - --load-model=*
+          ports:
+            - containerPort: 8000
+              name: http
+              protocol: TCP
+            - containerPort: 8001
+              name: grpc
+              protocol: TCP
+            - containerPort: 8002
+              name: metrics
+              protocol: TCP
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+            requests:
+              nvidia.com/gpu: "1"
+          securityContext:
+            privileged: false
+          volumeMounts:
+            - name: triton-repository
+              mountPath: /repository
+        - name: triton-controller
+          image: ccr.ccs.tencentyun.com/clobotics/triton-hot-loader:20260605-231744
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8090
+              name: controller
+              protocol: TCP
+          env:
+            - name: HOT_TRITON_MODEL_REPOSITORY
+              value: /repository/trt_models
+            - name: HOT_TRITON_STATE_FILE
+              value: /repository/.hot_loader/state.json
+            - name: HOT_TRITON_STAGING_ROOT
+              value: /repository/.staging
+            - name: MODEL_SOURCE_PATH
+              value: /trt_models
+            - name: MODEL_TARGET_PATH
+              value: /repository/trt_models
+            - name: TRITON_REPOSITORY_PVC
+              value: triton-models-storage
+            - name: TRITON_URL
+              value: http://127.0.0.1:8000
+            - name: TRITON_METRICS_URL
+              value: http://127.0.0.1:8002/metrics
+            - name: K8S_NAMESPACE
+              value: default
+            - name: MODEL_IMAGE_REGISTRY_PREFIX
+              value: ccr.ccs.tencentyun.com/clobotics/
+            - name: JOB_TTL_SECONDS_AFTER_FINISHED
+              value: "0"
+            - name: JOB_BACKOFF_LIMIT
+              value: "1"
+            - name: MODEL_COPY_CPU_REQUEST
+              value: 100m
+            - name: MODEL_COPY_MEMORY_REQUEST
+              value: 256Mi
+            - name: MODEL_COPY_CPU_LIMIT
+              value: "1"
+            - name: MODEL_COPY_MEMORY_LIMIT
+              value: 1Gi
+            - name: MAX_CONCURRENT_JOBS
+              value: "1"
+            - name: JOB_TOLERATIONS_JSON
+              value: >-
+                [{"key":"gpu","operator":"Exists","effect":"NoSchedule"},{"key":"cpu","operator":"Equal","value":"cveng","effect":"NoSchedule"},{"key":"env","operator":"Equal","value":"dev","effect":"NoSchedule"},{"key":"usedby","operator":"Equal","value":"haoyu","effect":"NoSchedule"}]
+          resources: {}
+          securityContext:
+            privileged: false
+          volumeMounts:
+            - name: triton-repository
+              mountPath: /repository
+      initContainers:
+        - name: model-init-sku-kenvue-jp-resnet
+          image: ccr.ccs.tencentyun.com/clobotics/sku-model-init:sku_kenvue_jp_resnet-20260320
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - cp -r /trt_models /repository
+          resources: {}
+          securityContext:
+            privileged: false
+          volumeMounts:
+            - name: triton-repository
+              mountPath: /repository
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+      tolerations:
+        - effect: NoSchedule
+          key: gpu
+          operator: Exists
+        - effect: NoSchedule
+          key: cpu
+          operator: Equal
+          value: cveng
+        - effect: NoSchedule
+          key: env
+          operator: Equal
+          value: dev
+        - effect: NoSchedule
+          key: usedby
+          operator: Equal
+          value: haoyu
+      volumes:
+        - name: triton-repository
+          persistentVolumeClaim:
+            claimName: triton-models-storage

@@ -15,7 +15,7 @@ from server import (
 )
 
 
-class ServerTritonUrlOverrideTests(unittest.TestCase):
+class ServerRoutesTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
@@ -23,9 +23,14 @@ class ServerTritonUrlOverrideTests(unittest.TestCase):
         base_dir = Path(self.temp_dir.name)
         self.config = HotLoaderConfig(
             triton_url="http://127.0.0.1:8000",
-            model_repository=base_dir / "model_repository",
+            model_repository=base_dir / "repository" / "trt_models",
             state_file=base_dir / "state.json",
             staging_root=base_dir / "staging",
+            model_source_path="/trt_models",
+            model_target_path="/repository/trt_models",
+            triton_repository_pvc="triton-repository-pvc",
+            k8s_namespace="default",
+            model_image_registry_prefix="ccr.ccs.tencentyun.com/clobotics/",
         )
         self.loader = TritonHotLoader(self.config)
         self.client = TestClient(create_app(self.loader))
@@ -69,33 +74,6 @@ class ServerTritonUrlOverrideTests(unittest.TestCase):
 
         self.assertEqual(self.loader.config.triton_url, "http://127.0.0.1:8000")
 
-    def test_apply_config_route_uses_request_header_override(self) -> None:
-        captured: dict[str, object] = {}
-
-        def fake_apply_config(self, config_map, *, prune_missing=True, force=False):
-            captured["triton_url"] = self.config.triton_url
-            captured["config"] = config_map
-            captured["prune_missing"] = prune_missing
-            captured["force"] = force
-            return {"success": True, "applied": [], "skipped": [], "removed": [], "errors": []}
-
-        with patch.object(TritonHotLoader, "apply_config", fake_apply_config):
-            response = self.client.post(
-                "/api/apply-config",
-                headers={TRITON_URL_OVERRIDE_HEADER: "http://127.0.0.1:29000"},
-                json={
-                    "config": {"demo": "registry.example.com/demo:model"},
-                    "prune_missing": False,
-                    "force": True,
-                },
-            )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(captured["triton_url"], "http://127.0.0.1:29000")
-        self.assertEqual(captured["config"], {"demo": "registry.example.com/demo:model"})
-        self.assertFalse(captured["prune_missing"])
-        self.assertTrue(captured["force"])
-
     def test_status_uses_metrics_port_override_with_effective_triton_host(self) -> None:
         def fake_metrics(self):
             return {
@@ -136,55 +114,104 @@ class ServerTritonUrlOverrideTests(unittest.TestCase):
             "http://10.0.0.8:19002/metrics",
         )
 
-    def test_load_from_image_route_uses_payload_urls_and_options(self) -> None:
-        captured: dict[str, object] = {}
+    def test_api_models_load_route_waits_for_final_status(self) -> None:
+        captured = {}
 
-        def fake_load_model_from_image(self, model_name, image, *, overwrite=True, load_after_copy=True):
+        def fake_create_model_copy_job_and_wait(self, model_name, image):
             captured["triton_url"] = self.config.triton_url
-            captured["triton_metrics_url"] = self.config.triton_metrics_url
             captured["model_name"] = model_name
             captured["image"] = image
-            captured["overwrite"] = overwrite
-            captured["load_after_copy"] = load_after_copy
+            effective_model_name = model_name or "demo_model"
             return {
                 "success": True,
-                "skipped": False,
-                "alias": "model_demo",
-                "model_name": model_name,
-                "image": image,
+                "job_name": "model-copy-demo",
+                "model_name": effective_model_name,
+                "status": "MODEL_READY",
             }
 
-        with patch.object(TritonHotLoader, "load_model_from_image", fake_load_model_from_image), patch.object(
-            TritonHotLoader,
-            "get_managed_state",
-            return_value={"aliases": {}, "managed_images": []},
-        ):
+        with patch.object(TritonHotLoader, "create_model_copy_job_and_wait", fake_create_model_copy_job_and_wait):
             response = self.client.post(
-                "/models/load-from-image",
+                "/api/models/load",
                 json={
-                    "triton_url": "http://10.0.0.8:18000",
-                    "triton_metrics_url": "http://10.0.0.8:18002/metrics",
-                    "models": [
-                        {
-                            "model_name": "demo_model",
-                            "image": "registry.example.com/demo:new",
-                        }
-                    ],
-                    "options": {
-                        "load_after_copy": False,
-                        "overwrite": True,
-                    },
+                    "image": "ccr.ccs.tencentyun.com/clobotics/demo:new",
                 },
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(captured["triton_url"], "http://10.0.0.8:18000")
-        self.assertEqual(captured["triton_metrics_url"], "http://10.0.0.8:18002/metrics")
-        self.assertEqual(captured["model_name"], "demo_model")
-        self.assertEqual(captured["image"], "registry.example.com/demo:new")
-        self.assertTrue(captured["overwrite"])
-        self.assertFalse(captured["load_after_copy"])
-        self.assertEqual(response.json()["applied"][0]["model_name"], "demo_model")
+        self.assertIsNone(captured["model_name"])
+        self.assertEqual(captured["image"], "ccr.ccs.tencentyun.com/clobotics/demo:new")
+        self.assertEqual(response.json()["job_name"], "model-copy-demo")
+        self.assertEqual(response.json()["status"], "MODEL_READY")
+
+    def test_api_models_load_batch_route_passes_models_list(self) -> None:
+        captured = {}
+
+        def fake_load_models_from_images_sync(self, models):
+            captured["models"] = models
+            return {"success": True, "completed": [{"job_name": "job-a", "status": "MODEL_READY"}], "errors": []}
+
+        with patch.object(TritonHotLoader, "load_models_from_images_sync", fake_load_models_from_images_sync):
+            response = self.client.post(
+                "/api/models/load-batch",
+                json={
+                    "models": [
+                        {
+                            "image": "ccr.ccs.tencentyun.com/clobotics/demo:a",
+                        }
+                    ]
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(captured["models"][0], {"image": "ccr.ccs.tencentyun.com/clobotics/demo:a"})
+        self.assertEqual(response.json()["completed"][0]["job_name"], "job-a")
+
+    def test_api_jobs_status_route_delegates_to_loader(self) -> None:
+        with patch.object(
+            TritonHotLoader,
+            "get_job_status",
+            return_value={
+                "job_name": "model-copy-demo",
+                "model_name": "demo_model",
+                "status": "COPY_RUNNING",
+                "pod_name": "pod-1",
+                "logs": "copying",
+            },
+        ):
+            response = self.client.get("/api/jobs/model-copy-demo")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "COPY_RUNNING")
+
+    def test_api_unload_route_passes_model_list_to_loader(self) -> None:
+        captured = {}
+
+        def fake_unload_models(self, model_names):
+            captured["model_names"] = list(model_names)
+            return {
+                "success": True,
+                "removed_models": list(model_names),
+                "affected_aliases": [],
+                "state": {"managed_model_count": 0},
+            }
+
+        with patch.object(TritonHotLoader, "unload_models", fake_unload_models), patch.object(
+            TritonHotLoader,
+            "get_managed_state",
+            return_value={"managed_model_count": 0},
+        ):
+            response = self.client.post(
+                "/api/unload",
+                json={"models": ["demo_model_a", "demo_model_b"]},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(captured["model_names"], ["demo_model_a", "demo_model_b"])
+        self.assertTrue(response.json()["success"])
+        self.assertEqual(
+            response.json()["model_result"]["removed_models"],
+            ["demo_model_a", "demo_model_b"],
+        )
 
     def test_runtime_gpu_status_route_formats_summary_payload(self) -> None:
         with patch.object(

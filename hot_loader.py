@@ -4,12 +4,12 @@ import json
 import os
 import re
 import shutil
-import subprocess
+import time
 import uuid
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, List, Mapping, Sequence
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -24,7 +24,6 @@ _ALIAS_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 _TRITON_VERSION_DIR_PATTERN = re.compile(r"^\d+$")
 _MODEL_VERSION_REF_PATTERN = re.compile(r"^(?P<model>[^@\s][^@]*)@(?P<version>\d+)$")
 _LOAD_UNLOAD_PATH_PATTERN = re.compile(r"^/v2/repository/models/.+/(load|unload)$")
-_MLMAN_CONFIG_PATTERN = re.compile(r"mlman(?:_|-)?config|mlmanconfig", re.IGNORECASE)
 _PROMETHEUS_SAMPLE_PATTERN = re.compile(
     r"^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(?P<labels>[^}]*)\})?\s+(?P<value>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)$"
 )
@@ -41,6 +40,26 @@ _RUNTIME_ROOT_ENV_NAMES = ("HOT_TRITON_RUNTIME_ROOT",)
 _MODEL_REPOSITORY_ENV_NAMES = ("HOT_TRITON_MODEL_REPOSITORY",)
 _STATE_FILE_ENV_NAMES = ("HOT_TRITON_STATE_FILE",)
 _STAGING_ROOT_ENV_NAMES = ("HOT_TRITON_STAGING_ROOT",)
+_MODEL_SOURCE_PATH_ENV_NAMES = ("MODEL_SOURCE_PATH",)
+_MODEL_TARGET_PATH_ENV_NAMES = ("MODEL_TARGET_PATH",)
+_TRITON_REPOSITORY_PVC_ENV_NAMES = ("TRITON_REPOSITORY_PVC",)
+_K8S_NAMESPACE_ENV_NAMES = ("K8S_NAMESPACE",)
+_MODEL_IMAGE_REGISTRY_PREFIX_ENV_NAMES = ("MODEL_IMAGE_REGISTRY_PREFIX",)
+_JOB_TTL_SECONDS_ENV_NAMES = ("JOB_TTL_SECONDS_AFTER_FINISHED",)
+_JOB_BACKOFF_LIMIT_ENV_NAMES = ("JOB_BACKOFF_LIMIT",)
+_MODEL_COPY_CPU_REQUEST_ENV_NAMES = ("MODEL_COPY_CPU_REQUEST",)
+_MODEL_COPY_MEMORY_REQUEST_ENV_NAMES = ("MODEL_COPY_MEMORY_REQUEST",)
+_MODEL_COPY_CPU_LIMIT_ENV_NAMES = ("MODEL_COPY_CPU_LIMIT",)
+_MODEL_COPY_MEMORY_LIMIT_ENV_NAMES = ("MODEL_COPY_MEMORY_LIMIT",)
+_MAX_CONCURRENT_JOBS_ENV_NAMES = ("MAX_CONCURRENT_JOBS",)
+_JOB_IMAGE_PULL_POLICY_ENV_NAMES = ("MODEL_COPY_IMAGE_PULL_POLICY",)
+_JOB_TOLERATIONS_ENV_NAMES = ("JOB_TOLERATIONS_JSON",)
+_CONTROLLER_LABEL = "triton-hot-loader"
+_MODEL_NAME_REQUEST_PATTERN = re.compile(r"^[a-z0-9_-]+$")
+_IMAGE_REF_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@:-]*$")
+_K8S_NAME_SANITIZE_PATTERN = re.compile(r"[^a-z0-9-]+")
+_IMAGE_TAG_RELEASE_SUFFIX_PATTERN = re.compile(r"(?:[-_])\d{8}(?:[-_]\d{6})?$")
+_MODEL_NAME_DERIVE_SANITIZE_PATTERN = re.compile(r"[^a-z0-9_]+")
 
 _EXPLICIT_CONTROL_HINT = (
     "当前 Triton 不允许通过 API 显式执行 load/unload。\n"
@@ -49,8 +68,14 @@ _EXPLICIT_CONTROL_HINT = (
     "2. 不要开启 repository polling；如果设置了 --repository-poll-secs，请删除该参数或显式设为 0；\n"
     "3. 修改启动参数后需要重启 Triton。\n"
     "推荐启动方式：\n"
-    "tritonserver --model-repository=/models --model-control-mode=EXPLICIT --repository-poll-secs=0"
+    "tritonserver --model-repository=/repository/trt_models --model-control-mode=EXPLICIT --repository-poll-secs=0"
 )
+
+_SYNC_LOAD_SUCCESS_STATUSES = {"MODEL_READY", "TRITON_RELOAD_SUCCEEDED"}
+_SYNC_LOAD_FAILURE_STATUSES = {"COPY_FAILED", "TRITON_RELOAD_FAILED"}
+_SYNC_LOAD_TERMINAL_STATUSES = _SYNC_LOAD_SUCCESS_STATUSES | _SYNC_LOAD_FAILURE_STATUSES
+_SYNC_LOAD_DEFAULT_TIMEOUT_SECONDS = 600.0
+_SYNC_LOAD_DEFAULT_POLL_INTERVAL_SECONDS = 2.0
 
 
 def _load_dotenv_values(env_file: Path) -> Dict[str, str]:
@@ -95,6 +120,42 @@ def _env_default(*names: str) -> str | None:
             return value.strip()
 
     return None
+
+
+def _normalize_job_tolerations(raw: Any, *, source_name: str) -> List[Dict[str, Any]]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise HotLoaderError(f"{source_name} 必须是 JSON 数组或 Python 列表")
+
+    normalized: List[Dict[str, Any]] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, Mapping):
+            raise HotLoaderError(f"{source_name}[{index}] 必须是对象")
+        normalized.append(dict(item))
+    return normalized
+
+
+def _parse_job_tolerations(raw_text: str | None, *, source_name: str) -> List[Dict[str, Any]]:
+    if raw_text is None or not raw_text.strip():
+        return []
+    try:
+        parsed = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise HotLoaderError(f"{source_name} 必须是合法 JSON") from exc
+    return _normalize_job_tolerations(parsed, source_name=source_name)
+
+
+def _derive_job_volume_mount_path(model_target_path: str) -> str:
+    normalized = model_target_path.strip()
+    if not normalized:
+        raise HotLoaderError("MODEL_TARGET_PATH 不能为空")
+
+    posix_path = PurePosixPath(normalized)
+    parent = str(posix_path.parent)
+    if normalized.startswith("/") and parent not in {"", ".", "/"}:
+        return parent
+    return str(posix_path)
 
 
 def _normalize_host_for_url(host: str) -> str:
@@ -171,6 +232,7 @@ def _default_runtime_paths(
 ) -> tuple[Path, Path, Path]:
     explicit_runtime_root = _env_default(*_RUNTIME_ROOT_ENV_NAMES)
     explicit_model_repository = _env_default(*_MODEL_REPOSITORY_ENV_NAMES)
+    target_model_repository = _env_default(*_MODEL_TARGET_PATH_ENV_NAMES)
     explicit_state_file = _env_default(*_STATE_FILE_ENV_NAMES)
     explicit_staging_root = _env_default(*_STAGING_ROOT_ENV_NAMES)
 
@@ -179,6 +241,8 @@ def _default_runtime_paths(
         model_repository = (
             Path(explicit_model_repository).expanduser()
             if explicit_model_repository
+            else Path(target_model_repository).expanduser()
+            if target_model_repository
             else runtime_root / "model_repository"
         )
         state_file = (
@@ -193,8 +257,8 @@ def _default_runtime_paths(
         )
         return model_repository, state_file, staging_root
 
-    if explicit_model_repository:
-        model_repository = Path(explicit_model_repository).expanduser()
+    if explicit_model_repository or target_model_repository:
+        model_repository = Path(explicit_model_repository or target_model_repository).expanduser()
         state_file = (
             Path(explicit_state_file).expanduser()
             if explicit_state_file
@@ -230,9 +294,21 @@ class HotLoaderConfig:
     state_file: Path
     staging_root: Path
     triton_metrics_url: str | None = None
-    image_model_root: str = "/trt_models"
+    model_source_path: str = "/trt_models"
+    model_target_path: str = "/repository/trt_models"
+    triton_repository_pvc: str = "triton-repository-pvc"
+    k8s_namespace: str = "default"
+    model_image_registry_prefix: str = "ccr.ccs.tencentyun.com/clobotics/"
+    job_ttl_seconds_after_finished: int = 0
+    job_backoff_limit: int = 1
+    model_copy_cpu_request: str = "100m"
+    model_copy_memory_request: str = "256Mi"
+    model_copy_cpu_limit: str = "1"
+    model_copy_memory_limit: str = "1Gi"
+    max_concurrent_jobs: int = 1
+    job_image_pull_policy: str = "IfNotPresent"
+    job_tolerations: List[Dict[str, Any]] = field(default_factory=list)
     request_timeout: float = 60.0
-    docker_binary: str = "docker"
 
     def __post_init__(self) -> None:
         self.triton_url = self.triton_url.rstrip("/")
@@ -241,6 +317,10 @@ class HotLoaderConfig:
         self.model_repository = Path(self.model_repository).expanduser().resolve()
         self.state_file = Path(self.state_file).expanduser().resolve()
         self.staging_root = Path(self.staging_root).expanduser().resolve()
+        self.job_tolerations = _normalize_job_tolerations(
+            self.job_tolerations,
+            source_name="job_tolerations",
+        )
 
     @classmethod
     def default(cls) -> "HotLoaderConfig":
@@ -253,6 +333,24 @@ class HotLoaderConfig:
             model_repository=model_repository,
             state_file=state_file,
             staging_root=staging_root,
+            model_source_path=_env_default(*_MODEL_SOURCE_PATH_ENV_NAMES) or "/trt_models",
+            model_target_path=_env_default(*_MODEL_TARGET_PATH_ENV_NAMES) or str(model_repository),
+            triton_repository_pvc=_env_default(*_TRITON_REPOSITORY_PVC_ENV_NAMES) or "triton-repository-pvc",
+            k8s_namespace=_env_default(*_K8S_NAMESPACE_ENV_NAMES) or "default",
+            model_image_registry_prefix=_env_default(*_MODEL_IMAGE_REGISTRY_PREFIX_ENV_NAMES)
+            or "ccr.ccs.tencentyun.com/clobotics/",
+            job_ttl_seconds_after_finished=int(_env_default(*_JOB_TTL_SECONDS_ENV_NAMES) or "0"),
+            job_backoff_limit=int(_env_default(*_JOB_BACKOFF_LIMIT_ENV_NAMES) or "1"),
+            model_copy_cpu_request=_env_default(*_MODEL_COPY_CPU_REQUEST_ENV_NAMES) or "100m",
+            model_copy_memory_request=_env_default(*_MODEL_COPY_MEMORY_REQUEST_ENV_NAMES) or "256Mi",
+            model_copy_cpu_limit=_env_default(*_MODEL_COPY_CPU_LIMIT_ENV_NAMES) or "1",
+            model_copy_memory_limit=_env_default(*_MODEL_COPY_MEMORY_LIMIT_ENV_NAMES) or "1Gi",
+            max_concurrent_jobs=int(_env_default(*_MAX_CONCURRENT_JOBS_ENV_NAMES) or "1"),
+            job_image_pull_policy=_env_default(*_JOB_IMAGE_PULL_POLICY_ENV_NAMES) or "IfNotPresent",
+            job_tolerations=_parse_job_tolerations(
+                _env_default(*_JOB_TOLERATIONS_ENV_NAMES),
+                source_name=_JOB_TOLERATIONS_ENV_NAMES[0],
+            ),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -262,9 +360,21 @@ class HotLoaderConfig:
             "model_repository": str(self.model_repository),
             "state_file": str(self.state_file),
             "staging_root": str(self.staging_root),
-            "image_model_root": self.image_model_root,
+            "model_source_path": self.model_source_path,
+            "model_target_path": self.model_target_path,
+            "triton_repository_pvc": self.triton_repository_pvc,
+            "k8s_namespace": self.k8s_namespace,
+            "model_image_registry_prefix": self.model_image_registry_prefix,
+            "job_ttl_seconds_after_finished": self.job_ttl_seconds_after_finished,
+            "job_backoff_limit": self.job_backoff_limit,
+            "model_copy_cpu_request": self.model_copy_cpu_request,
+            "model_copy_memory_request": self.model_copy_memory_request,
+            "model_copy_cpu_limit": self.model_copy_cpu_limit,
+            "model_copy_memory_limit": self.model_copy_memory_limit,
+            "max_concurrent_jobs": self.max_concurrent_jobs,
+            "job_image_pull_policy": self.job_image_pull_policy,
+            "job_tolerations": self.job_tolerations,
             "request_timeout": self.request_timeout,
-            "docker_binary": self.docker_binary,
         }
 
     def with_updates(self, **updates: Any) -> "HotLoaderConfig":
@@ -278,6 +388,8 @@ class TritonHotLoader:
 
     def __init__(self, config: HotLoaderConfig | None = None) -> None:
         self.config = config or HotLoaderConfig.default()
+        self._batch_v1_api: Any | None = None
+        self._core_v1_api: Any | None = None
         self._ensure_runtime_dirs()
 
     def _ensure_runtime_dirs(self) -> None:
@@ -289,7 +401,7 @@ class TritonHotLoader:
 
     @staticmethod
     def _empty_state() -> Dict[str, Any]:
-        return {"aliases": {}, "updated_at": None}
+        return {"aliases": {}, "jobs": {}, "updated_at": None}
 
     def _load_state(self) -> Dict[str, Any]:
         if not self.config.state_file.exists():
@@ -307,8 +419,13 @@ class TritonHotLoader:
         if not isinstance(aliases, dict):
             raise HotLoaderError("状态文件 aliases 字段格式错误")
 
+        jobs = data.get("jobs", {})
+        if not isinstance(jobs, dict):
+            raise HotLoaderError("状态文件 jobs 字段格式错误")
+
         return {
             "aliases": aliases,
+            "jobs": jobs,
             "updated_at": data.get("updated_at"),
         }
 
@@ -329,48 +446,79 @@ class TritonHotLoader:
                 f"非法 alias: {alias!r}。只允许字母、数字、下划线、点和短横线。"
             )
 
-    def _validate_config_map(self, config_map: Mapping[str, str]) -> Dict[str, str]:
-        if not isinstance(config_map, Mapping) or not config_map:
-            raise HotLoaderError("配置不能为空，且必须是 JSON 对象，value 为镜像地址")
-
-        normalized: Dict[str, str] = {}
-        for raw_key, image in config_map.items():
-            if not isinstance(image, str) or not image.strip():
-                raise HotLoaderError(f"配置项 {raw_key!r} 对应的镜像地址不能为空")
-            image_ref = image.strip()
-            if self._should_skip_config_entry(raw_key, image_ref):
-                continue
-            normalized[image_ref] = image_ref
-
+    @staticmethod
+    def _validate_model_name(model_name: str) -> str:
+        normalized = model_name.strip()
         if not normalized:
-            raise HotLoaderError("过滤 mlman_config 后没有可用模型镜像")
+            raise HotLoaderError("model_name 不能为空")
+        if not _MODEL_NAME_REQUEST_PATTERN.match(normalized):
+            raise HotLoaderError("model_name 只允许小写字母、数字、-、_")
+        return normalized
+
+    def _validate_image_ref(self, image_ref: str) -> str:
+        normalized = image_ref.strip()
+        if not normalized:
+            raise HotLoaderError("image 不能为空")
+        if not _IMAGE_REF_PATTERN.match(normalized):
+            raise HotLoaderError("image 包含非法字符")
+
+        prefix = self.config.model_image_registry_prefix.strip()
+        if prefix and not normalized.startswith(prefix):
+            raise HotLoaderError(
+                f"image 必须以允许的 registry 前缀开头: {self.config.model_image_registry_prefix}"
+            )
         return normalized
 
     @staticmethod
-    def _should_skip_config_entry(raw_key: Any, image_ref: str) -> bool:
-        key_text = raw_key if isinstance(raw_key, str) else ""
-        combined = f"{key_text} {image_ref}"
-        return bool(_MLMAN_CONFIG_PATTERN.search(combined))
+    def _extract_model_name_token_from_image_ref(image_ref: str) -> tuple[str, bool]:
+        ref_without_digest, _, _ = image_ref.partition("@")
+        last_slash_index = ref_without_digest.rfind("/")
+        last_colon_index = ref_without_digest.rfind(":")
+        if last_colon_index > last_slash_index:
+            return ref_without_digest[last_colon_index + 1 :], True
+        return ref_without_digest[last_slash_index + 1 :], False
+
+    @classmethod
+    def _derive_model_name_from_image_ref(cls, image_ref: str) -> str:
+        raw_candidate, extracted_from_tag = cls._extract_model_name_token_from_image_ref(image_ref)
+        normalized_candidate = raw_candidate.strip()
+        if extracted_from_tag:
+            normalized_candidate = _IMAGE_TAG_RELEASE_SUFFIX_PATTERN.sub("", normalized_candidate)
+
+        normalized_candidate = normalized_candidate.lower().replace("-", "_").replace(".", "_")
+        normalized_candidate = _MODEL_NAME_DERIVE_SANITIZE_PATTERN.sub("_", normalized_candidate)
+        normalized_candidate = re.sub(r"_+", "_", normalized_candidate).strip("_")
+        if not normalized_candidate:
+            raise HotLoaderError(f"无法从 image 自动提取 model_name: {image_ref}")
+        if not _MODEL_NAME_REQUEST_PATTERN.match(normalized_candidate):
+            raise HotLoaderError(f"根据 image 提取出的 model_name 非法: {normalized_candidate}")
+        return normalized_candidate
+
+    def _resolve_model_name_for_image(self, model_name: str | None, image_ref: str) -> tuple[str, str]:
+        normalized_image_ref = self._validate_image_ref(str(image_ref or ""))
+        normalized_model_name = str(model_name or "").strip()
+        if normalized_model_name:
+            return self._validate_model_name(normalized_model_name), normalized_image_ref
+        return self._derive_model_name_from_image_ref(normalized_image_ref), normalized_image_ref
 
     @staticmethod
-    def _bundle_key_for_image(image_ref: str) -> str:
-        digest = hashlib.sha1(image_ref.encode("utf-8")).hexdigest()[:12]
-        return f"bundle_{digest}"
+    def _normalize_k8s_name(value: str, *, limit: int = 63) -> str:
+        lowered = value.strip().lower().replace("_", "-")
+        lowered = _K8S_NAME_SANITIZE_PATTERN.sub("-", lowered).strip("-")
+        lowered = re.sub(r"-{2,}", "-", lowered)
+        return lowered[:limit].rstrip("-")
+
+    def _job_name_for_model(self, model_name: str) -> str:
+        normalized_model_name = self._normalize_k8s_name(model_name, limit=42)
+        if not normalized_model_name:
+            raise HotLoaderError("model_name 无法转换为合法的 Kubernetes Job 名称")
+        suffix = hashlib.sha1(f"{model_name}:{self._utc_now()}".encode("utf-8")).hexdigest()[:8]
+        return f"model-copy-{normalized_model_name}-{suffix}"[:63].rstrip("-")
 
     @staticmethod
     def _bundle_key_for_model_image(model_name: str, image_ref: str) -> str:
         digest = hashlib.sha1(f"{model_name}\0{image_ref}".encode("utf-8")).hexdigest()[:12]
         return f"model_{model_name}_{digest}"
-
-    def _find_state_entry_by_image(
-        self,
-        aliases: Mapping[str, Any],
-        image_ref: str,
-    ) -> tuple[str | None, Mapping[str, Any] | None]:
-        for alias, meta in aliases.items():
-            if isinstance(meta, Mapping) and meta.get("image") == image_ref:
-                return alias, meta
-        return None, None
 
     def _find_state_entry_by_model(
         self,
@@ -385,21 +533,45 @@ class TritonHotLoader:
                 return alias, meta
         return None, None
 
-    def _run_command(self, args: Sequence[str], *, allow_failure: bool = False) -> subprocess.CompletedProcess[str]:
-        try:
-            result = subprocess.run(
-                list(args),
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-        except FileNotFoundError as exc:
-            raise HotLoaderError(f"未找到命令: {args[0]!r}，请确认已安装并在 PATH 中") from exc
+    def _ensure_k8s_clients(self) -> tuple[Any, Any]:
+        if self._batch_v1_api is not None and self._core_v1_api is not None:
+            return self._batch_v1_api, self._core_v1_api
 
-        if result.returncode != 0 and not allow_failure:
-            stderr = result.stderr.strip() or result.stdout.strip() or "(无输出)"
-            raise HotLoaderError(f"命令执行失败: {' '.join(args)}\n{stderr}")
-        return result
+        try:
+            from kubernetes import client as k8s_client  # type: ignore[import-not-found]
+            from kubernetes import config as k8s_config  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise HotLoaderError("缺少 kubernetes 依赖，请重新构建镜像后再启动 controller") from exc
+
+        try:
+            k8s_config.load_incluster_config()
+        except Exception:
+            try:
+                k8s_config.load_kube_config()
+            except Exception as exc:
+                raise HotLoaderError(f"无法加载 Kubernetes 配置: {exc}") from exc
+
+        self._batch_v1_api = k8s_client.BatchV1Api()
+        self._core_v1_api = k8s_client.CoreV1Api()
+        return self._batch_v1_api, self._core_v1_api
+
+    def _get_batch_v1_api(self) -> Any:
+        batch_api, _ = self._ensure_k8s_clients()
+        return batch_api
+
+    def _get_core_v1_api(self) -> Any:
+        _, core_api = self._ensure_k8s_clients()
+        return core_api
+
+    @staticmethod
+    def _exception_text(exc: Exception) -> str:
+        body = getattr(exc, "body", None)
+        reason = getattr(exc, "reason", None)
+        if isinstance(body, str) and body.strip():
+            return body.strip()
+        if isinstance(reason, str) and reason.strip():
+            return reason.strip()
+        return str(exc)
 
     def _triton_request(
         self,
@@ -713,109 +885,571 @@ class TritonHotLoader:
                     return
             raise
 
-    def _pull_image(self, image_ref: str) -> None:
-        self._run_command([self.config.docker_binary, "pull", image_ref])
-
-    def _image_model_path(self, *parts: str) -> str:
-        root = self.config.image_model_root.rstrip("/")
-        if not root:
-            root = "/"
-
-        cleaned_parts = [part.strip("/") for part in parts if part and part.strip("/")]
-        if not cleaned_parts:
-            return root
-        if root == "/":
-            return "/" + "/".join(cleaned_parts)
-        return f"{root}/{'/'.join(cleaned_parts)}"
-
-    def _stage_image_bundle(self, image_ref: str) -> tuple[Path, Path, List[str]]:
-        operation_id = uuid.uuid4().hex[:12]
-        stage_dir = self.config.staging_root / operation_id
-        bundle_dir = stage_dir / "bundle"
-        bundle_dir.mkdir(parents=True, exist_ok=True)
-
-        self._pull_image(image_ref)
-
-        create_result = self._run_command([self.config.docker_binary, "create", image_ref])
-        container_id = create_result.stdout.strip()
-        if not container_id:
-            raise HotLoaderError(f"无法为镜像创建临时容器: {image_ref}")
-
+    def _active_job_count(self) -> int:
+        batch_api = self._get_batch_v1_api()
         try:
-            self._run_command(
-                [
-                    self.config.docker_binary,
-                    "cp",
-                    f"{container_id}:{self._image_model_path()}/.",
-                    str(bundle_dir),
-                ]
+            response = batch_api.list_namespaced_job(
+                namespace=self.config.k8s_namespace,
+                label_selector=f"app={_CONTROLLER_LABEL},job-role=model-copy",
             )
-        finally:
-            self._run_command(
-                [self.config.docker_binary, "rm", "-f", container_id],
-                allow_failure=True,
-            )
+        except Exception as exc:
+            raise HotLoaderError(f"查询 Kubernetes Job 失败: {self._exception_text(exc)}") from exc
 
-        models = self._discover_models(bundle_dir)
-        if not models:
-            shutil.rmtree(stage_dir, ignore_errors=True)
+        active = 0
+        for job in getattr(response, "items", []):
+            status = getattr(job, "status", None)
+            if (getattr(status, "active", 0) or 0) > 0:
+                active += 1
+                continue
+            if (getattr(status, "succeeded", 0) or 0) == 0 and (getattr(status, "failed", 0) or 0) == 0:
+                active += 1
+        return active
+
+    def _assert_job_capacity(self) -> None:
+        if self.config.max_concurrent_jobs < 1:
+            raise HotLoaderError("MAX_CONCURRENT_JOBS 必须大于等于 1")
+        active = self._active_job_count()
+        if active >= self.config.max_concurrent_jobs:
             raise HotLoaderError(
-                f"镜像 {image_ref} 中未发现模型目录，请确认 {self.config.image_model_root} 下是 Triton model repository 结构"
+                f"当前运行中的 Job 数量已达到上限 {self.config.max_concurrent_jobs}，请稍后再试"
             )
-        return stage_dir, bundle_dir, models
 
-    def _stage_image_model(self, image_ref: str, model_name: str) -> tuple[Path, Path]:
-        if not model_name or not model_name.strip():
-            raise HotLoaderError("model_name 不能为空")
+    def _build_job_manifest(self, job_name: str, model_name: str, image_ref: str) -> Dict[str, Any]:
+        model_label = self._normalize_k8s_name(model_name, limit=63) or "unknown-model"
+        job_volume_mount_path = _derive_job_volume_mount_path(self.config.model_target_path)
+        copy_script = "\n".join(
+            [
+                "set -eu",
+                'echo "MODEL_NAME=${MODEL_NAME}"',
+                'echo "MODEL_SOURCE_PATH=${MODEL_SOURCE_PATH}"',
+                'echo "MODEL_TARGET_PATH=${MODEL_TARGET_PATH}"',
+                'SOURCE_DIR="${MODEL_SOURCE_PATH%/}/${MODEL_NAME}"',
+                'if [ -d "${SOURCE_DIR}" ]; then',
+                '  COPY_SOURCE="${SOURCE_DIR}"',
+                'elif [ -d "${MODEL_SOURCE_PATH}" ]; then',
+                '  COPY_SOURCE="${MODEL_SOURCE_PATH}"',
+                "else",
+                '  echo "source path not found: ${MODEL_SOURCE_PATH} or ${SOURCE_DIR}"',
+                "  exit 1",
+                "fi",
+                'echo "COPY_SOURCE=${COPY_SOURCE}"',
+                'TARGET_DIR="${MODEL_TARGET_PATH%/}/${MODEL_NAME}"',
+                'rm -rf "${TARGET_DIR}"',
+                'mkdir -p "${TARGET_DIR}"',
+                'cp -R "${COPY_SOURCE}/." "${TARGET_DIR}/"',
+                'echo "model copy done"',
+            ]
+        )
 
-        normalized_model_name = model_name.strip()
-        operation_id = uuid.uuid4().hex[:12]
-        stage_dir = self.config.staging_root / operation_id
-        bundle_dir = stage_dir / "bundle"
-        model_stage_dir = bundle_dir / normalized_model_name
-        model_stage_dir.mkdir(parents=True, exist_ok=True)
+        return {
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": {
+                "name": job_name,
+                "namespace": self.config.k8s_namespace,
+                "labels": {
+                    "app": _CONTROLLER_LABEL,
+                    "job-role": "model-copy",
+                    "model-name": model_label,
+                },
+                "annotations": {
+                    "hot-loader/model-name": model_name,
+                    "hot-loader/image-ref": image_ref,
+                },
+            },
+            "spec": {
+                "backoffLimit": self.config.job_backoff_limit,
+                "ttlSecondsAfterFinished": self.config.job_ttl_seconds_after_finished,
+                "template": {
+                    "metadata": {
+                        "labels": {
+                            "app": _CONTROLLER_LABEL,
+                            "job-role": "model-copy",
+                            "model-name": model_label,
+                        }
+                    },
+                    "spec": {
+                        "restartPolicy": "Never",
+                        "tolerations": self.config.job_tolerations,
+                        "containers": [
+                            {
+                                "name": "model-copy",
+                                "image": image_ref,
+                                "imagePullPolicy": self.config.job_image_pull_policy,
+                                "env": [
+                                    {"name": "MODEL_NAME", "value": model_name},
+                                    {"name": "MODEL_SOURCE_PATH", "value": self.config.model_source_path},
+                                    {"name": "MODEL_TARGET_PATH", "value": self.config.model_target_path},
+                                ],
+                                "command": ["/bin/sh", "-c"],
+                                "args": [copy_script],
+                                "volumeMounts": [
+                                    {
+                                        "name": "triton-repository",
+                                        "mountPath": job_volume_mount_path,
+                                    }
+                                ],
+                                "resources": {
+                                    "requests": {
+                                        "cpu": self.config.model_copy_cpu_request,
+                                        "memory": self.config.model_copy_memory_request,
+                                    },
+                                    "limits": {
+                                        "cpu": self.config.model_copy_cpu_limit,
+                                        "memory": self.config.model_copy_memory_limit,
+                                    },
+                                },
+                            }
+                        ],
+                        "volumes": [
+                            {
+                                "name": "triton-repository",
+                                "persistentVolumeClaim": {
+                                    "claimName": self.config.triton_repository_pvc,
+                                },
+                            }
+                        ],
+                    },
+                },
+            },
+        }
 
-        self._pull_image(image_ref)
+    def _update_job_state(self, job_name: str, **updates: Any) -> Dict[str, Any]:
+        state = self._hydrate_state_aliases(self._load_state())
+        jobs = state.setdefault("jobs", {})
+        current = dict(jobs.get(job_name, {})) if isinstance(jobs.get(job_name), Mapping) else {}
+        current.update(updates)
+        current["job_name"] = job_name
+        current["updated_at"] = self._utc_now()
+        jobs[job_name] = current
+        state["updated_at"] = current["updated_at"]
+        self._save_state(state)
+        return current
 
-        create_result = self._run_command([self.config.docker_binary, "create", image_ref])
-        container_id = create_result.stdout.strip()
-        if not container_id:
-            raise HotLoaderError(f"无法为镜像创建临时容器: {image_ref}")
+    def _drop_model_from_aliases(self, aliases: Dict[str, Any], model_name: str) -> None:
+        for alias, meta in list(aliases.items()):
+            if not isinstance(meta, Mapping):
+                continue
+            hydrated = self._hydrate_alias_metadata(meta)
+            models = [name for name in hydrated.get("models", []) if name != model_name]
+            if len(models) == len(hydrated.get("models", [])):
+                continue
 
-        source_path = self._image_model_path(normalized_model_name)
+            if models:
+                hydrated["models"] = models
+                if isinstance(hydrated.get("model_versions"), dict):
+                    hydrated["model_versions"].pop(model_name, None)
+                if isinstance(hydrated.get("active_versions"), dict):
+                    hydrated["active_versions"].pop(model_name, None)
+                hydrated["updated_at"] = self._utc_now()
+                aliases[alias] = hydrated
+            else:
+                del aliases[alias]
+
+    def _register_loaded_model(self, model_name: str, image_ref: str) -> Dict[str, Any]:
+        if not (self.config.model_repository / model_name).exists():
+            raise HotLoaderError(
+                f"模型目录不存在: {self.config.model_repository / model_name}，请检查 Job 是否把文件复制到了 PVC"
+            )
+
+        model_versions, active_versions = self._collect_model_version_metadata(
+            self.config.model_repository,
+            [model_name],
+        )
+
+        state = self._hydrate_state_aliases(self._load_state())
+        aliases = state.setdefault("aliases", {})
+        self._drop_model_from_aliases(aliases, model_name)
+        alias = self._bundle_key_for_model_image(model_name, image_ref)
+        aliases[alias] = {
+            "image": image_ref,
+            "models": [model_name],
+            "model_versions": model_versions,
+            "active_versions": active_versions,
+            "updated_at": self._utc_now(),
+        }
+        state["updated_at"] = self._utc_now()
+        self._save_state(state)
+
+        return {
+            "alias": alias,
+            "model_versions": model_versions[model_name],
+            "active_version": active_versions[model_name],
+        }
+
+    def _list_job_pods(self, job_name: str) -> List[Any]:
+        core_api = self._get_core_v1_api()
         try:
-            try:
-                self._run_command(
-                    [
-                        self.config.docker_binary,
-                        "cp",
-                        f"{container_id}:{source_path}/.",
-                        str(model_stage_dir),
-                    ]
-                )
-            except HotLoaderError as exc:
-                raise HotLoaderError(
-                    f"镜像 {image_ref} 中未发现模型目录 {source_path}，请确认镜像结构与当前项目约定一致"
-                ) from exc
-        finally:
-            self._run_command(
-                [self.config.docker_binary, "rm", "-f", container_id],
-                allow_failure=True,
+            response = core_api.list_namespaced_pod(
+                namespace=self.config.k8s_namespace,
+                label_selector=f"job-name={job_name}",
             )
+        except Exception as exc:
+            raise HotLoaderError(f"查询 Job Pod 失败: {self._exception_text(exc)}") from exc
+        return list(getattr(response, "items", []) or [])
 
-        if not model_stage_dir.exists():
-            shutil.rmtree(stage_dir, ignore_errors=True)
-            raise HotLoaderError(
-                f"镜像 {image_ref} 中未发现模型目录 {source_path}，请确认镜像结构与当前项目约定一致"
+    def _read_pod_logs(self, pod_name: str | None) -> str | None:
+        if not pod_name:
+            return None
+
+        core_api = self._get_core_v1_api()
+        try:
+            logs = core_api.read_namespaced_pod_log(
+                name=pod_name,
+                namespace=self.config.k8s_namespace,
+                tail_lines=200,
             )
-        return stage_dir, bundle_dir
+        except Exception:
+            return None
+        return logs.strip() if isinstance(logs, str) and logs.strip() else None
+
+    def _read_pod_events(self, pod_name: str | None) -> List[Dict[str, Any]]:
+        if not pod_name:
+            return []
+
+        core_api = self._get_core_v1_api()
+        try:
+            response = core_api.list_namespaced_event(
+                namespace=self.config.k8s_namespace,
+                field_selector=(
+                    f"involvedObject.name={pod_name},"
+                    f"involvedObject.namespace={self.config.k8s_namespace}"
+                ),
+            )
+        except Exception:
+            return []
+
+        events: List[Dict[str, Any]] = []
+        for item in getattr(response, "items", []) or []:
+            events.append(
+                {
+                    "type": getattr(item, "type", None),
+                    "reason": getattr(item, "reason", None),
+                    "message": getattr(item, "message", None),
+                    "count": getattr(item, "count", None),
+                }
+            )
+        return events
 
     @staticmethod
-    def _discover_models(bundle_dir: Path) -> List[str]:
-        if not bundle_dir.exists():
-            return []
-        models = [path.name for path in bundle_dir.iterdir() if path.is_dir() and not path.name.startswith(".")]
-        return sorted(models)
+    def _pod_waiting_state(pod: Any) -> tuple[str | None, str | None]:
+        statuses = getattr(getattr(pod, "status", None), "container_statuses", None) or []
+        for status in statuses:
+            waiting = getattr(getattr(status, "state", None), "waiting", None)
+            if waiting is not None:
+                return getattr(waiting, "reason", None), getattr(waiting, "message", None)
+        return None, None
+
+    @staticmethod
+    def _pod_scheduling_state(pod: Any) -> tuple[str | None, str | None]:
+        conditions = getattr(getattr(pod, "status", None), "conditions", None) or []
+        for condition in conditions:
+            if getattr(condition, "type", None) != "PodScheduled":
+                continue
+            if str(getattr(condition, "status", "")).lower() != "false":
+                continue
+            return getattr(condition, "reason", None), getattr(condition, "message", None)
+        return None, None
+
+    @staticmethod
+    def _latest_event_detail(events: Sequence[Mapping[str, Any]]) -> str | None:
+        for item in reversed(list(events)):
+            message = str(item.get("message") or "").strip()
+            if message:
+                return message
+            reason = str(item.get("reason") or "").strip()
+            if reason:
+                return reason
+        return None
+
+    def _determine_job_status(
+        self,
+        job: Any,
+        pods: Sequence[Any],
+        events: Sequence[Mapping[str, Any]],
+    ) -> tuple[str, str]:
+        job_status = getattr(job, "status", None)
+        if (getattr(job_status, "succeeded", 0) or 0) > 0:
+            return "COPY_SUCCEEDED", "模型文件复制已完成"
+        if (getattr(job_status, "failed", 0) or 0) > 0:
+            return "COPY_FAILED", "Job 已失败，请检查 Pod 日志"
+
+        if pods:
+            pod = pods[0]
+            phase = getattr(getattr(pod, "status", None), "phase", None) or "Unknown"
+            waiting_reason, waiting_message = self._pod_waiting_state(pod)
+            scheduling_reason, scheduling_message = self._pod_scheduling_state(pod)
+            event_detail = self._latest_event_detail(events)
+            if waiting_reason in {"ErrImagePull", "ImagePullBackOff"}:
+                detail = waiting_message or waiting_reason
+                return "COPY_FAILED", f"镜像拉取失败: {detail}"
+            if phase == "Running":
+                return "COPY_RUNNING", "模型复制容器正在运行"
+            if phase == "Pending":
+                if scheduling_reason == "Unschedulable":
+                    detail = scheduling_message or event_detail or "Pod 调度失败"
+                    return "SCHEDULING", detail
+                detail = waiting_message or waiting_reason or event_detail or "等待调度或拉取镜像"
+                return "IMAGE_PULLING", detail
+            if phase == "Failed":
+                return "COPY_FAILED", waiting_message or event_detail or "Pod 运行失败"
+
+        return "JOB_CREATED", self._latest_event_detail(events) or "Job 已创建，等待 Kubernetes 调度"
+
+    def _model_ready_in_triton(self, model_name: str) -> bool:
+        for item in self.list_repository_models(safe=True):
+            if item.get("name") != model_name:
+                continue
+            state_text = str(item.get("state") or "").upper()
+            return state_text == "READY"
+        return False
+
+    def _finalize_successful_job(self, job_name: str, model_name: str, image_ref: str) -> Dict[str, Any]:
+        cached_state = self._load_state().get("jobs", {}).get(job_name, {})
+        if isinstance(cached_state, Mapping):
+            final_status = cached_state.get("status")
+            if final_status in {"MODEL_READY", "TRITON_RELOAD_SUCCEEDED", "TRITON_RELOAD_FAILED"}:
+                return dict(cached_state)
+
+        self._update_job_state(job_name, status="TRITON_RELOAD_RUNNING", model_name=model_name, image=image_ref)
+        try:
+            registration = self._register_loaded_model(model_name, image_ref)
+            self._load_model(model_name)
+            ready = self._model_ready_in_triton(model_name)
+        except Exception as exc:
+            failure = self._update_job_state(
+                job_name,
+                status="TRITON_RELOAD_FAILED",
+                model_name=model_name,
+                image=image_ref,
+                error=str(exc),
+            )
+            raise HotLoaderError(str(exc)) from exc
+
+        return self._update_job_state(
+            job_name,
+            status="MODEL_READY" if ready else "TRITON_RELOAD_SUCCEEDED",
+            model_name=model_name,
+            image=image_ref,
+            active_version=registration["active_version"],
+            model_versions=registration["model_versions"],
+            alias=registration["alias"],
+            triton_ready=ready,
+            error=None,
+        )
+
+    def create_model_copy_job(self, model_name: str | None, image_ref: str) -> Dict[str, Any]:
+        normalized_model_name, normalized_image_ref = self._resolve_model_name_for_image(model_name, image_ref)
+        self._assert_job_capacity()
+
+        job_name = self._job_name_for_model(normalized_model_name)
+        manifest = self._build_job_manifest(job_name, normalized_model_name, normalized_image_ref)
+        batch_api = self._get_batch_v1_api()
+
+        try:
+            created = batch_api.create_namespaced_job(
+                namespace=self.config.k8s_namespace,
+                body=manifest,
+            )
+        except Exception as exc:
+            raise HotLoaderError(f"创建 Kubernetes Job 失败: {self._exception_text(exc)}") from exc
+
+        metadata = getattr(created, "metadata", None)
+        self._update_job_state(
+            job_name,
+            status="JOB_CREATED",
+            model_name=normalized_model_name,
+            image=normalized_image_ref,
+            namespace=self.config.k8s_namespace,
+            job_uid=getattr(metadata, "uid", None),
+            created_at=self._utc_now(),
+        )
+
+        return {
+            "success": True,
+            "job_name": job_name,
+            "model_name": normalized_model_name,
+            "image": normalized_image_ref,
+            "status": "JOB_CREATED",
+        }
+
+    def wait_for_job_terminal_state(
+        self,
+        job_name: str,
+        *,
+        timeout_seconds: float = _SYNC_LOAD_DEFAULT_TIMEOUT_SECONDS,
+        poll_interval_seconds: float = _SYNC_LOAD_DEFAULT_POLL_INTERVAL_SECONDS,
+    ) -> Dict[str, Any]:
+        deadline = time.monotonic() + timeout_seconds
+        last_payload: Dict[str, Any] | None = None
+
+        while True:
+            payload = self.get_job_status(job_name)
+            last_payload = payload
+            status = str(payload.get("status") or "").upper()
+            if status in _SYNC_LOAD_TERMINAL_STATUSES:
+                return payload
+
+            if time.monotonic() >= deadline:
+                detail = str(payload.get("detail") or status or "等待超时")
+                raise HotLoaderError(
+                    f"等待模型加载超时 ({int(timeout_seconds)}s): {job_name} 当前状态 {status or '-'} - {detail}"
+                )
+
+            time.sleep(max(poll_interval_seconds, 0))
+
+    def create_model_copy_job_and_wait(
+        self,
+        model_name: str | None,
+        image_ref: str,
+        *,
+        timeout_seconds: float = _SYNC_LOAD_DEFAULT_TIMEOUT_SECONDS,
+        poll_interval_seconds: float = _SYNC_LOAD_DEFAULT_POLL_INTERVAL_SECONDS,
+    ) -> Dict[str, Any]:
+        submitted = self.create_model_copy_job(model_name, image_ref)
+        final_payload = self.wait_for_job_terminal_state(
+            submitted["job_name"],
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+        final_status = str(final_payload.get("status") or "").upper()
+        success = final_status in _SYNC_LOAD_SUCCESS_STATUSES
+        return {
+            **submitted,
+            **final_payload,
+            "submitted_status": submitted["status"],
+            "success": success,
+        }
+
+    def load_models_from_images(self, models: Iterable[Mapping[str, str]]) -> Dict[str, Any]:
+        submitted: List[Dict[str, Any]] = []
+        errors: List[Dict[str, Any]] = []
+
+        for item in models:
+            raw_model_name = item.get("model_name", "") if isinstance(item, Mapping) else ""
+            raw_image_ref = item.get("image", "") if isinstance(item, Mapping) else ""
+            model_name = str(raw_model_name or "")
+            image_ref = str(raw_image_ref or "")
+            resolved_model_name = model_name
+            try:
+                resolved_model_name, normalized_image_ref = self._resolve_model_name_for_image(model_name, image_ref)
+                submitted.append(self.create_model_copy_job(resolved_model_name, normalized_image_ref))
+            except HotLoaderError as exc:
+                errors.append(
+                    {
+                        "model_name": resolved_model_name,
+                        "image": image_ref,
+                        "error": str(exc),
+                    }
+                )
+
+        return {
+            "success": not errors,
+            "submitted": submitted,
+            "errors": errors,
+            "state": self.get_managed_state(),
+        }
+
+    def load_models_from_images_sync(self, models: Iterable[Mapping[str, str]]) -> Dict[str, Any]:
+        completed: List[Dict[str, Any]] = []
+        errors: List[Dict[str, Any]] = []
+
+        for item in models:
+            raw_model_name = item.get("model_name", "") if isinstance(item, Mapping) else ""
+            raw_image_ref = item.get("image", "") if isinstance(item, Mapping) else ""
+            model_name = str(raw_model_name or "")
+            image_ref = str(raw_image_ref or "")
+            resolved_model_name = model_name
+            try:
+                resolved_model_name, normalized_image_ref = self._resolve_model_name_for_image(model_name, image_ref)
+                result = self.create_model_copy_job_and_wait(resolved_model_name, normalized_image_ref)
+            except HotLoaderError as exc:
+                errors.append(
+                    {
+                        "model_name": resolved_model_name,
+                        "image": image_ref,
+                        "error": str(exc),
+                    }
+                )
+                continue
+
+            if result.get("success"):
+                completed.append(result)
+            else:
+                errors.append(
+                    {
+                        "model_name": str(result.get("model_name") or resolved_model_name),
+                        "image": image_ref,
+                        "error": str(result.get("detail") or result.get("status") or "加载失败"),
+                        "job_name": result.get("job_name"),
+                        "status": result.get("status"),
+                    }
+                )
+
+        return {
+            "success": not errors,
+            "completed": completed,
+            "errors": errors,
+            "state": self.get_managed_state(),
+        }
+
+    def get_job_status(self, job_name: str) -> Dict[str, Any]:
+        batch_api = self._get_batch_v1_api()
+        cached_jobs = self._load_state().get("jobs", {})
+        cached = dict(cached_jobs.get(job_name, {})) if isinstance(cached_jobs.get(job_name), Mapping) else {}
+
+        try:
+            job = batch_api.read_namespaced_job(
+                name=job_name,
+                namespace=self.config.k8s_namespace,
+            )
+        except Exception as exc:
+            if cached:
+                cached["detail"] = f"Job 当前不可读，可能已被 TTL 清理: {self._exception_text(exc)}"
+                return cached
+            raise HotLoaderError(f"查询 Kubernetes Job 失败: {self._exception_text(exc)}") from exc
+
+        pods = self._list_job_pods(job_name)
+        pod_name = getattr(getattr(pods[0], "metadata", None), "name", None) if pods else None
+        events = self._read_pod_events(pod_name)
+        controller_status, detail = self._determine_job_status(job, pods, events)
+        model_name = (
+            cached.get("model_name")
+            or getattr(getattr(job, "metadata", None), "annotations", {}).get("hot-loader/model-name")
+            or ""
+        )
+        image_ref = (
+            cached.get("image")
+            or getattr(getattr(job, "metadata", None), "annotations", {}).get("hot-loader/image-ref")
+            or ""
+        )
+        logs = self._read_pod_logs(pod_name)
+
+        if controller_status == "COPY_SUCCEEDED" and model_name and image_ref:
+            try:
+                finalized = self._finalize_successful_job(job_name, model_name, image_ref)
+                controller_status = str(finalized.get("status") or controller_status)
+                detail = "Triton 模型已完成 load/reload" if controller_status == "MODEL_READY" else detail
+            except HotLoaderError as exc:
+                controller_status = "TRITON_RELOAD_FAILED"
+                detail = str(exc)
+
+        payload = self._update_job_state(
+            job_name,
+            status=controller_status,
+            detail=detail,
+            model_name=model_name,
+            image=image_ref,
+            pod_name=pod_name,
+            logs=logs,
+            events=events,
+        )
+        payload["job_name"] = job_name
+        payload["model_name"] = model_name
+        payload["pod_name"] = pod_name
+        payload["logs"] = logs
+        payload["events"] = events
+        return payload
 
     @staticmethod
     def _sort_versions(versions: Iterable[str]) -> List[str]:
@@ -970,39 +1604,6 @@ class TritonHotLoader:
 
         shutil.copytree(source_dir, target_dir, ignore=ignore)
 
-    def _build_model_owner_index(self, state: Dict[str, Any], *, exclude_alias: str | None = None) -> Dict[str, str]:
-        owner_index: Dict[str, str] = {}
-        for alias, meta in state.get("aliases", {}).items():
-            if alias == exclude_alias:
-                continue
-            for model_name in meta.get("models", []):
-                owner_index[model_name] = alias
-        return owner_index
-
-    def _prepare_target_directory(
-        self,
-        source_dir: Path,
-        target_dir: Path,
-        backup_root: Path,
-    ) -> Path | None:
-        backup_dir: Path | None = None
-        if target_dir.exists():
-            backup_root.mkdir(parents=True, exist_ok=True)
-            backup_dir = backup_root / target_dir.name
-            if backup_dir.exists():
-                shutil.rmtree(backup_dir)
-            target_dir.rename(backup_dir)
-
-        try:
-            shutil.copytree(source_dir, target_dir)
-        except Exception as exc:
-            if target_dir.exists():
-                shutil.rmtree(target_dir, ignore_errors=True)
-            if backup_dir and backup_dir.exists():
-                backup_dir.rename(target_dir)
-            raise HotLoaderError(f"拷贝模型目录失败: {source_dir} -> {target_dir} ({exc})") from exc
-        return backup_dir
-
     @staticmethod
     def _restore_backup(backup_dir: Path | None, target_dir: Path) -> None:
         if target_dir.exists():
@@ -1147,6 +1748,11 @@ class TritonHotLoader:
             for alias, meta in state.get("aliases", {}).items()
             if isinstance(meta, Mapping)
         }
+        jobs = {
+            job_name: dict(meta)
+            for job_name, meta in state.get("jobs", {}).items()
+            if isinstance(meta, Mapping)
+        }
         managed_images = sorted(
             [
                 {
@@ -1190,6 +1796,23 @@ class TritonHotLoader:
             "managed_models": managed_models,
             "managed_model_versions": managed_model_versions,
             "managed_active_versions": managed_active_versions,
+            "jobs": jobs,
+            "job_count": len(jobs),
+            "active_jobs": sorted(
+                [
+                    job_name
+                    for job_name, meta in jobs.items()
+                    if str(meta.get("status") or "")
+                    in {
+                        "JOB_CREATED",
+                        "SCHEDULING",
+                        "IMAGE_PULLING",
+                        "COPY_RUNNING",
+                        "COPY_SUCCEEDED",
+                        "TRITON_RELOAD_RUNNING",
+                    }
+                ]
+            ),
         }
 
     def get_status(self) -> Dict[str, Any]:
@@ -1207,266 +1830,6 @@ class TritonHotLoader:
             },
             "manager": state,
         }
-
-    def apply_config(
-        self,
-        config_map: Mapping[str, str],
-        *,
-        prune_missing: bool = True,
-        force: bool = False,
-    ) -> Dict[str, Any]:
-        desired = self._validate_config_map(config_map)
-        state = self._hydrate_state_aliases(self._load_state())
-        aliases = state.setdefault("aliases", {})
-        desired_images = sorted(desired.values())
-
-        result: Dict[str, Any] = {
-            "success": True,
-            "requested_images": desired_images,
-            "prune_missing": prune_missing,
-            "force": force,
-            "applied": [],
-            "skipped": [],
-            "removed": [],
-            "errors": [],
-        }
-
-        if prune_missing:
-            missing_aliases = sorted(
-                alias
-                for alias, meta in aliases.items()
-                if isinstance(meta, Mapping) and meta.get("image") not in desired_images
-            )
-            for alias in missing_aliases:
-                try:
-                    removal = self.unload_alias(alias)
-                    result["removed"].append(removal)
-                except HotLoaderError as exc:
-                    result["success"] = False
-                    result["errors"].append({"alias": alias, "error": str(exc)})
-
-        for image_ref in desired_images:
-            alias, current = self._find_state_entry_by_image(aliases, image_ref)
-            if current and current.get("image") == image_ref and not force:
-                current_meta = self._hydrate_alias_metadata(current)
-                result["skipped"].append(
-                    {
-                        "image": image_ref,
-                        "bundle_id": alias,
-                        "models": current_meta.get("models", []),
-                        "model_versions": current_meta.get("model_versions", {}),
-                        "active_versions": current_meta.get("active_versions", {}),
-                        "reason": "image unchanged",
-                    }
-                )
-                continue
-
-            try:
-                target_alias = alias or self._bundle_key_for_image(image_ref)
-                applied = self._apply_alias(target_alias, image_ref)
-                result["applied"].append(applied)
-            except HotLoaderError as exc:
-                result["success"] = False
-                result["errors"].append({"bundle_id": alias, "image": image_ref, "error": str(exc)})
-
-        result["state"] = self.get_managed_state()
-        return result
-
-    def load_model_from_image(
-        self,
-        model_name: str,
-        image_ref: str,
-        *,
-        overwrite: bool = True,
-        load_after_copy: bool = True,
-    ) -> Dict[str, Any]:
-        normalized_model_name = model_name.strip()
-        normalized_image_ref = image_ref.strip()
-        if not normalized_model_name:
-            raise HotLoaderError("model_name 不能为空")
-        if not normalized_image_ref:
-            raise HotLoaderError("image 不能为空")
-
-        state = self._hydrate_state_aliases(self._load_state())
-        aliases = state.setdefault("aliases", {})
-        current_alias, current_meta = self._find_state_entry_by_model(aliases, normalized_model_name)
-        current_image = current_meta.get("image") if isinstance(current_meta, Mapping) else None
-        target_dir = self.config.model_repository / normalized_model_name
-
-        if (
-            current_image == normalized_image_ref
-            and target_dir.exists()
-            and isinstance(current_meta, Mapping)
-        ):
-            hydrated_current = self._hydrate_alias_metadata(current_meta)
-            active_versions = hydrated_current.get("active_versions", {})
-            active_version = active_versions.get(normalized_model_name) if isinstance(active_versions, dict) else None
-            return {
-                "success": True,
-                "skipped": True,
-                "alias": current_alias,
-                "image": normalized_image_ref,
-                "model_name": normalized_model_name,
-                "source_path": self._image_model_path(normalized_model_name),
-                "target_path": str(target_dir),
-                "model_versions": hydrated_current.get("model_versions", {}).get(normalized_model_name, []),
-                "active_version": active_version,
-                "load_after_copy": load_after_copy,
-                "reason": "model image unchanged",
-                "updated_at": hydrated_current.get("updated_at"),
-            }
-
-        if target_dir.exists() and not overwrite:
-            raise HotLoaderError(f"模型目录已存在，且 overwrite=false: {target_dir}")
-
-        if current_alias is not None:
-            if not overwrite:
-                raise HotLoaderError(
-                    f"模型 {normalized_model_name} 当前已由 {current_alias} 管理，且 overwrite=false"
-                )
-            self.unload_models([normalized_model_name])
-
-        stage_dir: Path | None = None
-        try:
-            stage_dir, bundle_dir = self._stage_image_model(normalized_image_ref, normalized_model_name)
-            model_versions, active_versions = self._collect_model_version_metadata(
-                bundle_dir,
-                [normalized_model_name],
-            )
-
-            backup_root = stage_dir / "_backup"
-            backup_dir = self._prepare_target_directory(
-                bundle_dir / normalized_model_name,
-                target_dir,
-                backup_root,
-            )
-            try:
-                wrote_version_policy = self._write_active_version_policy(
-                    target_dir,
-                    active_versions[normalized_model_name],
-                )
-                if load_after_copy:
-                    self._load_model(normalized_model_name)
-            except Exception as exc:
-                self._restore_backup(backup_dir, target_dir)
-                raise HotLoaderError(
-                    f"复制模型 {normalized_model_name} 后处理失败，已尝试回滚目录: {exc}"
-                ) from exc
-
-            updated_state = self._hydrate_state_aliases(self._load_state())
-            updated_aliases = updated_state.setdefault("aliases", {})
-            alias = self._bundle_key_for_model_image(normalized_model_name, normalized_image_ref)
-            updated_aliases[alias] = {
-                "image": normalized_image_ref,
-                "models": [normalized_model_name],
-                "model_versions": model_versions,
-                "active_versions": active_versions,
-                "updated_at": self._utc_now(),
-            }
-            updated_state["updated_at"] = self._utc_now()
-            self._save_state(updated_state)
-            self._cleanup_backup(backup_dir)
-
-            return {
-                "success": True,
-                "skipped": False,
-                "alias": alias,
-                "image": normalized_image_ref,
-                "model_name": normalized_model_name,
-                "source_path": self._image_model_path(normalized_model_name),
-                "target_path": str(target_dir),
-                "model_versions": model_versions[normalized_model_name],
-                "active_version": active_versions[normalized_model_name],
-                "load_after_copy": load_after_copy,
-                "loaded": load_after_copy,
-                "wrote_version_policy": wrote_version_policy,
-                "updated_at": updated_aliases[alias]["updated_at"],
-            }
-        finally:
-            if stage_dir and stage_dir.exists():
-                shutil.rmtree(stage_dir, ignore_errors=True)
-
-    def _apply_alias(self, alias: str, image_ref: str) -> Dict[str, Any]:
-        self._validate_alias(alias)
-        state = self._hydrate_state_aliases(self._load_state())
-        aliases = state.setdefault("aliases", {})
-        current = aliases.get(alias, {})
-        old_models = set(current.get("models", []))
-
-        stage_dir: Path | None = None
-        try:
-            stage_dir, bundle_dir, new_models = self._stage_image_bundle(image_ref)
-            owner_index = self._build_model_owner_index(state, exclude_alias=alias)
-            conflicts = {name: owner_index[name] for name in new_models if name in owner_index}
-            model_versions, active_versions = self._collect_model_version_metadata(bundle_dir, new_models)
-            if conflicts:
-                conflict_text = ", ".join(
-                    f"{model} -> {owner}" for model, owner in sorted(conflicts.items())
-                )
-                raise HotLoaderError(
-                    f"alias {alias} 试图接管已被其他 alias 管理的模型: {conflict_text}"
-                )
-
-            backup_root = stage_dir / "_backup"
-            deployed_models: List[str] = []
-            backups: Dict[str, Path | None] = {}
-            version_policy_models: List[str] = []
-
-            for model_name in new_models:
-                source_dir = bundle_dir / model_name
-                target_dir = self.config.model_repository / model_name
-                backup_dir = self._prepare_target_directory(source_dir, target_dir, backup_root)
-                if self._write_active_version_policy(target_dir, active_versions[model_name]):
-                    version_policy_models.append(model_name)
-                try:
-                    self._load_model(model_name)
-                except HotLoaderError as exc:
-                    self._restore_backup(backup_dir, target_dir)
-                    try:
-                        if backup_dir and target_dir.exists():
-                            self._load_model(model_name)
-                    except HotLoaderError:
-                        pass
-                    raise HotLoaderError(
-                        f"按版本重载模型 {model_name} 失败，已尝试回滚目录: {exc}"
-                    ) from exc
-
-                backups[model_name] = backup_dir
-                deployed_models.append(model_name)
-
-            removed_models = sorted(old_models - set(new_models))
-            for model_name in removed_models:
-                self._unload_model(model_name, tolerate_missing=True)
-                self._delete_model_directory(model_name)
-
-            aliases[alias] = {
-                "image": image_ref,
-                "models": sorted(new_models),
-                "model_versions": model_versions,
-                "active_versions": active_versions,
-                "updated_at": self._utc_now(),
-            }
-            state["updated_at"] = self._utc_now()
-            self._save_state(state)
-
-            for backup_dir in backups.values():
-                self._cleanup_backup(backup_dir)
-
-            return {
-                "alias": alias,
-                "image": image_ref,
-                "models": sorted(new_models),
-                "model_versions": model_versions,
-                "active_versions": active_versions,
-                "reloaded_models": sorted(deployed_models),
-                "removed_models": removed_models,
-                "version_policy_models": sorted(version_policy_models),
-                "version_load_strategy": "load_api_reload_with_specific_version_policy",
-                "updated_at": aliases[alias]["updated_at"],
-            }
-        finally:
-            if stage_dir and stage_dir.exists():
-                shutil.rmtree(stage_dir, ignore_errors=True)
 
     def unload_alias(self, alias: str) -> Dict[str, Any]:
         self._validate_alias(alias)
@@ -1733,36 +2096,8 @@ class TritonHotLoader:
             "state": self.get_managed_state(),
         }
 
-    def load_config_file(self, config_file: str | Path) -> Dict[str, str]:
-        path = Path(config_file).expanduser().resolve()
-        if not path.exists():
-            raise HotLoaderError(f"配置文件不存在: {path}")
-        try:
-            with path.open("r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-        except json.JSONDecodeError as exc:
-            raise HotLoaderError(f"配置文件不是合法 JSON: {path}") from exc
-        return self._validate_config_map(payload)
-
-    def sample_config(self) -> Dict[str, str]:
-        sample_path = Path(__file__).resolve().parent / "sample_config.json"
-        if sample_path.exists():
-            with sample_path.open("r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-            if not isinstance(payload, Mapping):
-                raise HotLoaderError(f"示例配置格式错误: {sample_path}")
-
-            sanitized: Dict[str, str] = {}
-            for raw_key, image in payload.items():
-                if not isinstance(image, str) or not image.strip():
-                    continue
-                image_ref = image.strip()
-                if self._should_skip_config_entry(raw_key, image_ref):
-                    continue
-                key = raw_key if isinstance(raw_key, str) and raw_key.strip() else self._bundle_key_for_image(image_ref)
-                sanitized[key] = image_ref
-
-            if not sanitized:
-                raise HotLoaderError("示例配置中没有可用模型镜像")
-            return sanitized
-        return {}
+    def get_models_overview(self) -> Dict[str, Any]:
+        return {
+            "managed": self.get_managed_state(),
+            "triton_models": self.list_repository_models(safe=True),
+        }

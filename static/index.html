@@ -1,207 +1,233 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="light">
 
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Triton Hot Loader</title>
-    <link rel="stylesheet" href="/static/style.css?v=20260604-endpoint-display">
+    <link rel="stylesheet" href="/static/style.css?v=20260608-image-derived-model-name">
 </head>
 
 <body>
-    <div class="app-shell">
-        <header class="topbar">
-            <div class="brand">
-                <h1>Triton Hot Loader</h1>
-                <span class="brand-subtle">镜像部署 · 模型版本管理</span>
+    <div class="site-shell">
+        <header class="site-header">
+            <div class="site-brand">
+                <span class="site-wordmark">TRITON</span>
+                <span class="site-brand-copy">Hot Loader Controller</span>
             </div>
-            <div class="topbar-actions">
-                <button id="refresh-all-btn" class="secondary">刷新状态</button>
-                <div class="theme-switch" aria-label="主题切换">
-                    <button id="theme-light-btn" class="theme-btn" type="button">☀️ 浅色</button>
-                    <button id="theme-dark-btn" class="theme-btn" type="button">🌙 深色</button>
-                </div>
+            <nav class="site-nav" aria-label="主导航">
+                <a href="#overview">概览</a>
+                <a href="#operations">操作</a>
+                <a href="#monitoring">监控</a>
+                <a href="#repository">仓库</a>
+            </nav>
+            <div class="site-actions">
+                <button id="refresh-all-btn" class="primary" type="button">刷新状态</button>
             </div>
         </header>
 
-        <main class="workspace">
-            <aside class="sidebar">
-                <section class="panel composer-panel">
-                    <div class="section-heading section-heading-compact">
-                        <div>
-                            <h2>部署配置</h2>
-                        </div>
-                        <div class="inline-actions">
-                            <button id="load-sample-btn" class="ghost" type="button">填充示例</button>
-                            <button id="format-json-btn" class="ghost" type="button">格式化</button>
-                        </div>
+        <main class="page-flow">
+            <section class="hero-stage" id="overview">
+                <div class="hero-copy">
+                    <span class="hero-eyebrow">Triton Hot Loader</span>
+                    <h1>统一模型加载与运维</h1>
+                    <p class="hero-lead">
+                        基于 Kubernetes Job、Triton Repository API 和现有 GPU metrics 接口的统一运维面板，提供单模型加载、批量加载、状态查询和热操作功能，同时展示实时监控数据和模型仓库状态。
+                    </p>
+                    <div class="hero-actions">
+                        <a class="cta-link primary-link" href="#monitoring">查看实时监控</a>
+                        <a class="cta-link secondary-link" href="#repository">查看模型仓库</a>
                     </div>
+                </div>
 
-                    <textarea id="config-input" class="code-editor" spellcheck="false" placeholder="{
-  &quot;entry_1&quot;: &quot;registry.example.com/team/unit-model:v1&quot;,
-  &quot;entry_2&quot;: &quot;registry.example.com/team/sku-model:v2&quot;
-}"></textarea>
-                    <div class="helper-chip">自动忽略 <code>mlman_config / mlmanconfig</code></div>
-
-                    <div class="option-stack">
-                        <label class="checkbox-label">
-                            <input id="prune-missing" type="checkbox">
-                            <span>自动卸载不在本次 JSON 中的镜像</span>
-                        </label>
-                        <label class="checkbox-label">
-                            <input id="force-reload" type="checkbox">
-                            <span>即使镜像地址没变也强制重载</span>
-                        </label>
-                    </div>
-
-                    <div class="endpoint-editor">
-                        <div class="endpoint-editor-head">
-                            <span class="status-caption">Endpoint 设置</span>
-                            <span id="triton-url-status" class="status-caption">默认读取环境变量 / .env</span>
-                        </div>
-
-                        <div class="endpoint-editor-row endpoint-input-row">
-                            <label class="endpoint-field">
-                                <span class="filter-label">Triton URL</span>
-                                <input id="triton-url-input" class="endpoint-input mono" type="text" inputmode="url"
-                                    spellcheck="false" placeholder="http://127.0.0.1:8000">
-                            </label>
-
-                            <label class="endpoint-field">
-                                <span class="filter-label">Metrics 端口</span>
-                                <input id="metrics-port-input" class="endpoint-input mono" type="number"
-                                    inputmode="numeric" min="1" max="65535" placeholder="自动 +2">
-                            </label>
-                        </div>
-
-                        <div class="endpoint-editor-actions">
-
-                            <button id="save-triton-url-btn" class="ghost" type="button">保存</button>
-                            <button id="reset-triton-url-btn" class="ghost" type="button">恢复默认</button>
-                        </div>
-                    </div>
-
-                    <button id="apply-config-btn" class="primary block-btn" type="button">执行热加载</button>
-                </section>
-
-                <section class="panel operation-panel">
-                    <div class="section-heading section-heading-compact">
-                        <div>
-                            <h2>任务进度</h2>
-                        </div>
-                        <div class="operation-heading-meta">
-                            <span id="operation-elapsed" class="mono status-caption">耗时 --</span>
-                            <span id="operation-badge" class="badge operation-badge idle">空闲中</span>
-                        </div>
-                    </div>
-
-                    <div class="console-box">
-                        <strong id="operation-title" class="operation-title">等待新的操作</strong>
-                        <div class="progress-track" aria-label="当前操作进度">
-                            <div id="operation-progress-fill" class="progress-fill idle"></div>
-                        </div>
-                        <div class="progress-meta">
-                            <span id="operation-stage-text">点击任意操作按钮后，这里会显示执行阶段。</span>
-                            <span id="operation-progress-text">0%</span>
-                        </div>
-                        <div id="operation-inline-tip" class="inline-tip info">提示：首次拉大镜像时会慢一些，保持页面打开就好。</div>
-                    </div>
-
-                    <div class="operation-notes-grid">
-                        <div class="subpanel">
-                            <h3>操作提示</h3>
-                            <ul id="operation-tip-list" class="operation-tip-list">
-                                <li class="highlight">热加载会依次执行配置校验、镜像处理和 Triton 重载。</li>
-                            </ul>
-                        </div>
-                        <div class="subpanel">
-                            <h3>最近进展</h3>
-                            <ul id="operation-log-list" class="operation-log-list">
-                                <li class="empty">暂无操作记录</li>
-                            </ul>
-                        </div>
-                    </div>
-                </section>
-
-                <section class="panel gpu-panel">
-                    <div class="section-heading section-heading-compact">
-                        <div>
-                            <h2>显存监控</h2>
-                        </div>
-                        <span id="gpu-metrics-updated" class="mono status-caption">每秒自动刷新 · 等待拉取</span>
-                    </div>
-                    <div id="gpu-monitor-panel" class="gpu-monitor-panel">
-                        <div class="empty">等待显存指标...</div>
-                    </div>
-                </section>
-            </aside>
-
-            <section class="content">
-                <section class="panel summary-panel">
+                <section class="panel hero-summary-panel">
                     <div class="section-heading">
                         <div>
                             <h2>运行概览</h2>
+                            <p>当前 Triton、控制器和模型仓库的核心状态。</p>
                         </div>
                     </div>
                     <div id="status-summary" class="status-summary"></div>
                 </section>
+            </section>
 
-                <section class="panel models-panel">
-                    <div class="section-heading section-heading-wrap">
-                        <div>
-                            <h2>模型版本管理</h2>
-                        </div>
-                        <div class="action-cluster">
-                            <label class="select-toggle top-select" for="select-all-models">
-                                <input id="select-all-models" type="checkbox">
-                                <span>全选当前筛选结果</span>
-                            </label>
-                            <div class="button-group">
-                                <button id="reload-models-btn" class="secondary" type="button">重载选中模型</button>
-                                <button id="unload-models-btn" class="danger" type="button">卸载选中模型/版本</button>
+            <section class="workspace-shell" id="operations">
+                <aside class="sidebar">
+                    <div class="section-copy">
+                        <span class="section-kicker">操作</span>
+                        <h2>加载与运维</h2>
+                        <p>把单模型、批量加载、状态查询和热操作集中在左侧，保持直接、快速的控制路径。</p>
+                    </div>
+
+                    <section class="panel composer-panel">
+                        <div class="section-heading section-heading-compact">
+                            <div>
+                                <h2>单模型加载</h2>
+                                <p class="status-caption">模型名会按镜像 tag 自动提取，不需要手动输入。</p>
                             </div>
                         </div>
-                    </div>
+                        <label class="endpoint-field">
+                            <span class="filter-label">Image</span>
+                            <input id="single-image" class="endpoint-input mono" type="text"
+                                placeholder="ccr.ccs.tencentyun.com/clobotics/unit-model-init:unit_empty_space_uspg_yolov8-20260430">
+                        </label>
+                        <button id="load-model-btn" class="primary block-btn" type="button">创建加载 Job</button>
+                    </section>
 
-                    <div class="toolbar-row">
-                        <div class="filter-shell">
-                            <!-- <span class="filter-label">筛选</span> -->
-                            <input id="model-filter-input" class="filter-input" type="text"
-                                placeholder="模型名 / 版本 / 镜像关键字">
-                            <button id="clear-model-filter-btn" class="ghost" type="button">×</button>
+                    <section class="panel composer-panel">
+                        <div class="section-heading section-heading-compact">
+                            <div>
+                                <h2>批量加载</h2>
+                                <p class="status-caption">可省略 model_name，后端会根据每个 image 自动提取。</p>
+                            </div>
+                            <div class="inline-actions">
+                                <button id="load-sample-btn" class="ghost" type="button">填充示例</button>
+                            </div>
                         </div>
-                        <span id="model-selection-summary" class="status-caption">共 0 个模型 · 已选 0 项</span>
-                    </div>
+                        <textarea id="batch-input" class="code-editor" spellcheck="false" wrap="soft"></textarea>
+                        <button id="load-batch-btn" class="secondary block-btn" type="button">批量创建 Job</button>
+                    </section>
 
-                    <div id="model-groups-panel" class="model-groups-panel">
-                        <div class="empty">暂无模型版本信息</div>
-                    </div>
-                </section>
-
-                <section class="panel result-card">
-                    <div class="section-heading section-heading-compact">
-                        <div>
-                            <h2>最近一次操作结果</h2>
+                    <section class="panel composer-panel">
+                        <div class="section-heading section-heading-compact">
+                            <div>
+                                <h2>Job 查询</h2>
+                            </div>
                         </div>
-                        <button id="clear-result-btn" class="ghost" type="button">×</button>
-                    </div>
-                    <pre id="result-panel" class="result-panel">等待操作...</pre>
-                </section>
+                        <label class="endpoint-field">
+                            <span class="filter-label">Job Name</span>
+                            <input id="job-name-input" class="endpoint-input mono" type="text" placeholder="model-copy-xxx">
+                        </label>
+                        <button id="job-status-btn" class="secondary block-btn" type="button">查询 Job 状态</button>
+                    </section>
 
-                <div class="debug-stack">
-                    <details class="panel debug-panel">
-                        <summary>已管理镜像视图</summary>
-                        <div id="managed-image-grid" class="managed-image-grid">
-                            <div class="empty">暂无已管理镜像</div>
+                    <section class="panel composer-panel">
+                        <div class="section-heading section-heading-compact">
+                            <div>
+                                <h2>模型运维</h2>
+                            </div>
                         </div>
-                    </details>
+                        <label class="endpoint-field">
+                            <span class="filter-label">Model Name</span>
+                            <input id="action-model-name" class="endpoint-input mono" type="text" placeholder="unit_empty_space_uspg_yolov8">
+                        </label>
+                        <div class="button-group">
+                            <button id="reload-model-btn" class="secondary" type="button">重载模型</button>
+                            <button id="unload-model-btn" class="danger" type="button">卸载模型</button>
+                        </div>
+                    </section>
 
-                    <details class="panel debug-panel">
-                        <summary>原始 Triton repository/index</summary>
+                    <section class="panel composer-panel">
+                        <div class="section-heading section-heading-compact">
+                            <div>
+                                <h2>Endpoint 覆盖</h2>
+                            </div>
+                        </div>
+                        <label class="endpoint-field">
+                            <span class="filter-label">Triton URL</span>
+                            <input id="triton-url-input" class="endpoint-input mono" type="text" placeholder="http://127.0.0.1:8000">
+                        </label>
+                        <label class="endpoint-field">
+                            <span class="filter-label">Metrics 端口</span>
+                            <input id="metrics-port-input" class="endpoint-input mono" type="number" placeholder="8002">
+                        </label>
+                        <div class="button-group">
+                            <button id="save-triton-url-btn" class="ghost" type="button">保存</button>
+                            <button id="reset-triton-url-btn" class="ghost" type="button">恢复默认</button>
+                        </div>
+                    </section>
+                </aside>
+
+                <section class="content" id="monitoring">
+                    <div class="section-copy section-copy-inline">
+                        <span class="section-kicker">监控</span>
+                        <h2>实时状态与仓库视图</h2>
+                        <p>GPU 指标、最近响应、Job、已管理模型和 repository/index 保持在同一页里。</p>
+                    </div>
+
+                    <div class="content-duo content-duo-wide">
+                        <section class="panel gpu-panel">
+                            <div class="section-heading">
+                                <div>
+                                    <h2>GPU 监控</h2>
+                                    <p>基于已有 metrics 接口的实时指标。</p>
+                                </div>
+                                <span id="gpu-metrics-updated" class="status-caption mono">等待指标...</span>
+                            </div>
+                            <div id="gpu-monitor-panel" class="gpu-monitor-panel">
+                                <div class="empty">等待 GPU 指标...</div>
+                            </div>
+                        </section>
+
+                        <section class="panel result-card">
+                            <div class="section-heading section-heading-compact">
+                                <div>
+                                    <h2>最近一次响应</h2>
+                                    <p>显示最近一次接口调用返回。</p>
+                                </div>
+                            </div>
+                            <pre id="result-panel" class="result-panel">等待操作...</pre>
+                        </section>
+                    </div>
+
+                    <div class="content-duo">
+                        <section class="panel models-panel">
+                            <div class="section-heading">
+                                <div>
+                                    <h2>Job 列表</h2>
+                                    <p>当前控制器记录到的任务状态，最多展示最近 50 条。</p>
+                                </div>
+                            </div>
+                            <div id="job-list-panel" class="managed-image-grid job-list-grid">
+                                <div class="empty">暂无 Job 记录</div>
+                            </div>
+                        </section>
+
+                        <section class="panel models-panel">
+                            <div class="section-heading">
+                                <div>
+                                    <h2>已管理模型</h2>
+                                    <p>按镜像聚合的已管理模型。</p>
+                                </div>
+                            </div>
+                            <div id="managed-models-panel" class="managed-image-grid">
+                                <div class="empty">暂无已管理模型</div>
+                            </div>
+                        </section>
+                    </div>
+
+                    <section class="panel debug-panel" id="repository">
+                        <div class="section-heading">
+                            <div>
+                                <h2>Triton repository/index</h2>
+                                <p>支持搜索筛选、多选和批量热卸载。</p>
+                            </div>
+                        </div>
+                        <div class="toolbar-row triton-toolbar">
+                            <div class="filter-shell triton-filter-shell" role="search">
+                                <span class="triton-search-icon" aria-hidden="true">
+                                    <svg viewBox="0 0 24 24" focusable="false">
+                                        <path d="M10.5 4.5a6 6 0 1 0 0 12a6 6 0 0 0 0-12Zm0 0L19.5 19.5" />
+                                    </svg>
+                                </span>
+                                <input id="triton-model-filter-input" class="filter-input triton-search-input" type="text"
+                                    placeholder="搜索模型名、版本、状态或 reason">
+                                <button id="clear-triton-model-filter-btn" class="ghost triton-clear-btn" type="button">清空</button>
+                            </div>
+                            <div class="button-group">
+                                <label class="select-toggle top-select" for="select-all-triton-models">
+                                    <input id="select-all-triton-models" type="checkbox">
+                                    <span>全选筛选结果</span>
+                                </label>
+                                <button id="bulk-unload-triton-btn" class="danger" type="button">批量热卸载</button>
+                            </div>
+                        </div>
+                        <p id="triton-selection-summary" class="status-caption triton-selection-summary">当前共 0 行 · 已选 0 个模型</p>
                         <div class="table-wrap">
                             <table>
                                 <thead>
                                     <tr>
+                                        <th class="triton-select-head">选择</th>
                                         <th>Name</th>
                                         <th>Version</th>
                                         <th>State</th>
@@ -210,18 +236,18 @@
                                 </thead>
                                 <tbody id="triton-model-body">
                                     <tr>
-                                        <td colspan="4" class="empty">暂无 Triton 模型信息</td>
+                                        <td colspan="5" class="empty">暂无 Triton 模型信息</td>
                                     </tr>
                                 </tbody>
                             </table>
                         </div>
-                    </details>
-                </div>
+                    </section>
+                </section>
             </section>
         </main>
     </div>
 
-    <script src="/static/app.js?v=20260604-endpoint-display"></script>
+    <script src="/static/app.js?v=20260608-image-derived-model-name"></script>
 </body>
 
 </html>
