@@ -33,7 +33,7 @@ class ServerRoutesTests(unittest.TestCase):
             model_image_registry_prefix="ccr.ccs.tencentyun.com/clobotics/",
         )
         self.loader = TritonHotLoader(self.config)
-        self.client = TestClient(create_app(self.loader))
+        self.client = TestClient(create_app(self.loader, enable_background_worker=False))
         self.addCleanup(self.client.close)
 
     def test_status_uses_request_header_override_without_mutating_base_loader(self) -> None:
@@ -134,6 +134,7 @@ class ServerRoutesTests(unittest.TestCase):
                 "/api/models/load",
                 json={
                     "image": "ccr.ccs.tencentyun.com/clobotics/demo:new",
+                    "wait_for_ready": True,
                 },
             )
 
@@ -142,6 +143,71 @@ class ServerRoutesTests(unittest.TestCase):
         self.assertEqual(captured["image"], "ccr.ccs.tencentyun.com/clobotics/demo:new")
         self.assertEqual(response.json()["job_name"], "model-copy-demo")
         self.assertEqual(response.json()["status"], "MODEL_READY")
+
+    def test_api_models_load_route_can_submit_without_waiting(self) -> None:
+        captured = {}
+
+        def fake_create_model_copy_job(self, model_name, image, callback=None):
+            captured["model_name"] = model_name
+            captured["image"] = image
+            captured["callback"] = callback
+            return {
+                "success": True,
+                "job_name": "model-copy-demo",
+                "model_name": model_name or "demo_model",
+                "status": "JOB_CREATED",
+            }
+
+        with patch.object(TritonHotLoader, "create_model_copy_job", fake_create_model_copy_job):
+            response = self.client.post(
+                "/api/models/load",
+                json={
+                    "image": "ccr.ccs.tencentyun.com/clobotics/demo:new",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(captured["model_name"])
+        self.assertEqual(captured["image"], "ccr.ccs.tencentyun.com/clobotics/demo:new")
+        self.assertIsNone(captured["callback"])
+        self.assertEqual(response.json()["status"], "JOB_CREATED")
+
+    def test_api_models_load_route_registers_callback(self) -> None:
+        captured = {}
+
+        def fake_create_model_copy_job(self, model_name, image, callback=None):
+            captured["callback"] = callback
+            return {
+                "success": True,
+                "job_name": "model-copy-demo",
+                "model_name": model_name or "demo_model",
+                "status": "JOB_CREATED",
+                "callback_registered": bool(callback),
+            }
+
+        with patch.object(TritonHotLoader, "create_model_copy_job", fake_create_model_copy_job):
+            response = self.client.post(
+                "/api/models/load",
+                json={
+                    "image": "ccr.ccs.tencentyun.com/clobotics/demo:new",
+                    "callback": {
+                        "url": "https://callback.example.com/hook",
+                        "events": ["terminal"],
+                        "token": "secret-token",
+                    },
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            captured["callback"],
+            {
+                "url": "https://callback.example.com/hook",
+                "events": ["terminal"],
+                "token": "secret-token",
+            },
+        )
+        self.assertTrue(response.json()["callback_registered"])
 
     def test_api_models_load_batch_route_passes_models_list(self) -> None:
         captured = {}
@@ -154,6 +220,7 @@ class ServerRoutesTests(unittest.TestCase):
             response = self.client.post(
                 "/api/models/load-batch",
                 json={
+                    "wait_for_ready": True,
                     "models": [
                         {
                             "image": "ccr.ccs.tencentyun.com/clobotics/demo:a",
@@ -165,6 +232,29 @@ class ServerRoutesTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(captured["models"][0], {"image": "ccr.ccs.tencentyun.com/clobotics/demo:a"})
         self.assertEqual(response.json()["completed"][0]["job_name"], "job-a")
+
+    def test_api_models_load_batch_route_can_submit_without_waiting(self) -> None:
+        captured = {}
+
+        def fake_load_models_from_images(self, models):
+            captured["models"] = models
+            return {"success": True, "submitted": [{"job_name": "job-a", "status": "JOB_CREATED"}], "errors": []}
+
+        with patch.object(TritonHotLoader, "load_models_from_images", fake_load_models_from_images):
+            response = self.client.post(
+                "/api/models/load-batch",
+                json={
+                    "models": [
+                        {
+                            "image": "ccr.ccs.tencentyun.com/clobotics/demo:a",
+                        }
+                    ],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(captured["models"][0], {"image": "ccr.ccs.tencentyun.com/clobotics/demo:a"})
+        self.assertEqual(response.json()["submitted"][0]["job_name"], "job-a")
 
     def test_api_jobs_status_route_delegates_to_loader(self) -> None:
         with patch.object(
@@ -212,6 +302,15 @@ class ServerRoutesTests(unittest.TestCase):
             response.json()["model_result"]["removed_models"],
             ["demo_model_a", "demo_model_b"],
         )
+
+    def test_api_unload_route_rejects_version_level_request(self) -> None:
+        response = self.client.post(
+            "/api/unload",
+            json={"versions": ["demo_model@3"]},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("取消版本管理", response.json()["detail"])
 
     def test_runtime_gpu_status_route_formats_summary_payload(self) -> None:
         with patch.object(

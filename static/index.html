@@ -5,7 +5,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Triton Hot Loader</title>
-    <link rel="stylesheet" href="/static/style.css?v=20260608-image-derived-model-name">
+    <link rel="stylesheet" href="/static/style.css?v=20260609-collapsible-panels">
 </head>
 
 <body>
@@ -59,17 +59,34 @@
                         <p>把单模型、批量加载、状态查询和热操作集中在左侧，保持直接、快速的控制路径。</p>
                     </div>
 
+                    <section class="panel operation-status-panel is-idle" id="operation-status-panel" aria-live="polite">
+                        <div class="section-heading section-heading-compact">
+                            <div>
+                                <h2>执行状态</h2>
+                                <p id="operation-status-caption" class="status-caption">等待操作。</p>
+                            </div>
+                            <span id="operation-status-badge" class="mini-badge muted">Idle</span>
+                        </div>
+                        <div class="operation-progress-track" aria-hidden="true">
+                            <span id="operation-progress-bar" class="operation-progress-bar"></span>
+                        </div>
+                        <div class="operation-status-meta">
+                            <strong id="operation-status-title">暂无进行中的任务</strong>
+                            <span id="operation-status-detail">提交加载、卸载或查询后，这里会显示当前进度。</span>
+                        </div>
+                    </section>
+
                     <section class="panel composer-panel">
                         <div class="section-heading section-heading-compact">
                             <div>
                                 <h2>单模型加载</h2>
-                                <p class="status-caption">模型名会按镜像 tag 自动提取，不需要手动输入。</p>
+                                <p class="status-caption">模型名会按镜像 tag 自动提取；如果同名，会直接替换当前模型。</p>
                             </div>
                         </div>
                         <label class="endpoint-field">
                             <span class="filter-label">Image</span>
                             <input id="single-image" class="endpoint-input mono" type="text"
-                                placeholder="ccr.ccs.tencentyun.com/clobotics/unit-model-init:unit_empty_space_uspg_yolov8-20260430">
+                                placeholder="输入模型镜像地址">
                         </label>
                         <button id="load-model-btn" class="primary block-btn" type="button">创建加载 Job</button>
                     </section>
@@ -78,7 +95,7 @@
                         <div class="section-heading section-heading-compact">
                             <div>
                                 <h2>批量加载</h2>
-                                <p class="status-caption">可省略 model_name，后端会根据每个 image 自动提取。</p>
+                                <p class="status-caption">可省略 model_name；同名模型会直接覆盖，不保留历史版本。</p>
                             </div>
                             <div class="inline-actions">
                                 <button id="load-sample-btn" class="ghost" type="button">填充示例</button>
@@ -109,7 +126,7 @@
                         </div>
                         <label class="endpoint-field">
                             <span class="filter-label">Model Name</span>
-                            <input id="action-model-name" class="endpoint-input mono" type="text" placeholder="unit_empty_space_uspg_yolov8">
+                            <input id="action-model-name" class="endpoint-input mono" type="text" placeholder="输入 Triton 模型名">
                         </label>
                         <div class="button-group">
                             <button id="reload-model-btn" class="secondary" type="button">重载模型</button>
@@ -171,27 +188,51 @@
                     </div>
 
                     <div class="content-duo">
-                        <section class="panel models-panel">
-                            <div class="section-heading">
+                        <section class="panel models-panel panel-collapsible is-collapsed">
+                            <div class="section-heading section-heading-collapsible">
                                 <div>
                                     <h2>Job 列表</h2>
                                     <p>当前控制器记录到的任务状态，最多展示最近 50 条。</p>
                                 </div>
+                                <button
+                                    class="panel-collapse-toggle"
+                                    type="button"
+                                    aria-expanded="false"
+                                    aria-controls="job-list-content"
+                                    data-collapse-target="job-list-content"
+                                >
+                                    <span class="panel-collapse-label">展开</span>
+                                    <span class="panel-collapse-icon" aria-hidden="true"></span>
+                                </button>
                             </div>
-                            <div id="job-list-panel" class="managed-image-grid job-list-grid">
-                                <div class="empty">暂无 Job 记录</div>
+                            <div id="job-list-content" class="panel-collapsible-body" hidden>
+                                <div id="job-list-panel" class="managed-image-grid job-list-grid">
+                                    <div class="empty">暂无 Job 记录</div>
+                                </div>
                             </div>
                         </section>
 
-                        <section class="panel models-panel">
-                            <div class="section-heading">
+                        <section class="panel models-panel panel-collapsible is-collapsed">
+                            <div class="section-heading section-heading-collapsible">
                                 <div>
                                     <h2>已管理模型</h2>
-                                    <p>按镜像聚合的已管理模型。</p>
+                                    <p>按模型名维护的当前加载记录。</p>
                                 </div>
+                                <button
+                                    class="panel-collapse-toggle"
+                                    type="button"
+                                    aria-expanded="false"
+                                    aria-controls="managed-models-content"
+                                    data-collapse-target="managed-models-content"
+                                >
+                                    <span class="panel-collapse-label">展开</span>
+                                    <span class="panel-collapse-icon" aria-hidden="true"></span>
+                                </button>
                             </div>
-                            <div id="managed-models-panel" class="managed-image-grid">
-                                <div class="empty">暂无已管理模型</div>
+                            <div id="managed-models-content" class="panel-collapsible-body" hidden>
+                                <div id="managed-models-panel" class="managed-image-grid">
+                                    <div class="empty">暂无已管理模型</div>
+                                </div>
                             </div>
                         </section>
                     </div>
@@ -206,8 +247,9 @@
                         <div class="toolbar-row triton-toolbar">
                             <div class="filter-shell triton-filter-shell" role="search">
                                 <span class="triton-search-icon" aria-hidden="true">
-                                    <svg viewBox="0 0 24 24" focusable="false">
-                                        <path d="M10.5 4.5a6 6 0 1 0 0 12a6 6 0 0 0 0-12Zm0 0L19.5 19.5" />
+                                    <svg viewBox="0 0 20 20" focusable="false">
+                                        <circle cx="8.25" cy="8.25" r="4.75" />
+                                        <path d="M11.7 11.7L16 16" />
                                     </svg>
                                 </span>
                                 <input id="triton-model-filter-input" class="filter-input triton-search-input" type="text"
@@ -247,7 +289,7 @@
         </main>
     </div>
 
-    <script src="/static/app.js?v=20260608-image-derived-model-name"></script>
+    <script src="/static/app.js?v=20260609-collapsible-panels"></script>
 </body>
 
 </html>

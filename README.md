@@ -13,6 +13,8 @@
 
 当前实现已经完全移除热加载链路里的 `docker pull / docker create / docker cp / docker rm / docker.sock` 依赖。
 
+同名模型现在采用直接替换语义：无论镜像新旧，只要解析出的 `model_name` 相同，就覆盖当前仓库里的同名模型；controller 不再对同名模型做额外版本管理。
+
 ## 架构
 
 ```text
@@ -33,6 +35,10 @@ Triton Repository PVC
     | POST /v2/repository/models/{model}/load
     v
 Triton Server
+    |
+    | POST callback (optional, terminal only)
+    v
+Business System
 ```
 
 ## 环境变量
@@ -61,7 +67,7 @@ MODEL_COPY_CPU_REQUEST=100m
 MODEL_COPY_MEMORY_REQUEST=256Mi
 MODEL_COPY_CPU_LIMIT=1
 MODEL_COPY_MEMORY_LIMIT=1Gi
-MAX_CONCURRENT_JOBS=1
+MAX_CONCURRENT_JOBS=0
 JOB_TOLERATIONS_JSON=[{"key":"gpu","operator":"Exists","effect":"NoSchedule"}]
 ```
 
@@ -71,8 +77,11 @@ JOB_TOLERATIONS_JSON=[{"key":"gpu","operator":"Exists","effect":"NoSchedule"}]
 - Controller 最好与 Triton 共享同一个 Repository PVC。
 - 现有项目里的模型初始化镜像默认把模型放在 `/trt_models/<model_name>/...`，controller 会优先按这个结构复制；如果镜像里直接是单模型内容目录，也会回退兼容。
 - 生产环境建议把 `HOT_TRITON_STATE_FILE` 和 `HOT_TRITON_STAGING_ROOT` 放在 `trt_models` 目录外层，避免 `.hot_loader/`、`.staging/` 进入 Triton model store。
+- 同名模型替换时，model-copy Job 会先把新模型复制到挂载卷里的 `.staging/`，再切换到目标目录，避免长时间直接覆盖线上模型目录。
 - 当 `MODEL_TARGET_PATH` 是 `/repository/trt_models` 这种 PVC 子目录时，model-copy Job 会把 PVC 挂到它的父目录 `/repository`，然后再复制到 `${MODEL_TARGET_PATH}/${MODEL_NAME}`。
 - `JOB_TTL_SECONDS_AFTER_FINISHED=0` 表示 Job 一旦进入完成态就立即交给 TTL controller 删除；controller 自己的状态文件仍会保留最近一次结果摘要。
+- 即使复制 Job 已被 TTL 清理，只要模型目录已经落盘，controller 仍会继续自动推进后续的 Triton load/reload 状态机。
+- 线上建议保留 `JOB_TTL_SECONDS_AFTER_FINISHED=0`；排查复制或调度问题时，建议临时调大到 `300`，便于直接看 Job / Pod / Event。
 - 如果集群节点带 taint，需要通过 `JOB_TOLERATIONS_JSON` 给动态创建的 model-copy Job 补 tolerations。
 - Triton 必须使用 `EXPLICIT` 模式，且 `repository_poll_secs=0`。
 
@@ -94,7 +103,10 @@ JOB_TOLERATIONS_JSON=[{"key":"gpu","operator":"Exists","effect":"NoSchedule"}]
 - `POST /api/models/unload-batch`
 - `POST /api/models/reload`
 
-其中加载接口是同步语义：请求会一直等待到 Triton load/reload 进入终态再返回。
+当前加载接口默认是异步语义：请求在 Job 创建成功后立即返回。
+如果调用方确实希望当前 HTTP 请求一直等到 Triton load/reload 进入终态，可以显式传 `wait_for_ready: true`。
+
+如果调用方不想轮询，也可以在加载请求里附带 `callback` 配置；controller 会在 Job 进入终态时主动回调一次业务接口。
 
 ### 加载单个模型
 
@@ -130,8 +142,52 @@ POST /api/models/load-batch
 说明：
 
 - `model_name` 现在是可选字段；如果不传，controller 会优先从 image tag 提取。
+- `wait_for_ready` 默认是 `false`；设为 `true` 时，接口会阻塞到 Triton 最终进入终态。
 - 提取规则会去掉 tag 末尾常见的日期/时间发布后缀，例如 `unit_empty_space_uspg_yolov8-20260430 -> unit_empty_space_uspg_yolov8`。
 - tag 中的 `-`、`.` 会统一规整成 `_`，例如 `model-a -> model_a`。
+- 如果新请求解析出的 `model_name` 与当前已加载模型同名，controller 会直接替换旧模型，不保留同名历史版本。
+- `callback` 是可选对象；当前只支持 `terminal` 事件，也就是 `MODEL_READY`、`COPY_FAILED`、`TRITON_RELOAD_FAILED` 这三类终态回调。
+- `callback.url` 必须是你自己的业务回调接收地址，不应该填写 hot-loader 自己的 `http://10.2.24.10:30890/...`。
+- `callback.token` 如果提供，controller 会在回调请求头里附带 `X-Hot-Loader-Signature: sha256=<hmac>`，签名内容是 `timestamp + "." + raw_body`。
+
+### 终态 Callback
+
+```json
+{
+  "image": "ccr.ccs.tencentyun.com/clobotics/unit-model-init:unit_empty_space_uspg_yolov8-20260430",
+  "callback": {
+    "url": "https://your-service.example.com/triton/callback",
+    "events": ["terminal"],
+    "token": "shared-secret"
+  }
+}
+```
+
+回调体示例：
+
+```json
+{
+  "event_id": "2b96094a-24f1-472d-b0b8-6c52756d7f68",
+  "event_type": "job.status.changed",
+  "job_name": "model-copy-unit-empty-space-uspg-yolov8-xxxxxx",
+  "model_name": "unit_empty_space_uspg_yolov8",
+  "image": "ccr.ccs.tencentyun.com/clobotics/unit-model-init:unit_empty_space_uspg_yolov8-20260430",
+  "status": "MODEL_READY",
+  "detail": "Triton 模型已完成 load/reload",
+  "terminal": true,
+  "triton_ready": true,
+  "updated_at": "2026-06-09T09:58:10+00:00",
+  "callback_attempt": 1
+}
+```
+
+回调请求头：
+
+- `Content-Type: application/json`
+- `X-Hot-Loader-Event: job.status.changed`
+- `X-Hot-Loader-Job-Name: <job_name>`
+- `X-Hot-Loader-Timestamp: <unix-ts>`
+- `X-Hot-Loader-Signature: sha256=<hmac>`（仅当提供 `callback.token` 时）
 
 ### curl POST 示例
 
@@ -165,6 +221,21 @@ curl -X POST "${BASE_URL}/api/models/load-batch" \
         "image": "ccr.ccs.tencentyun.com/clobotics/unit-model-init:unit_hanging_product_yolov5-20230620"
       }
     ]
+  }'
+```
+
+加载并注册 callback：
+
+```bash
+curl -X POST "${BASE_URL}/api/models/load" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "image": "ccr.ccs.tencentyun.com/clobotics/unit-model-init:unit_empty_space_uspg_yolov8-20260430",
+    "callback": {
+      "url": "https://your-service.example.com/triton/callback",
+      "events": ["terminal"],
+      "token": "shared-secret"
+    }
   }'
 ```
 
@@ -341,4 +412,4 @@ Controller 需要 namespace 级别权限：
 - `model_name` 只允许小写字母、数字、`-`、`_`
 - Job 不申请 GPU
 - Job 会挂载 `TRITON_REPOSITORY_PVC`
-- `MAX_CONCURRENT_JOBS` 会限制同时运行的 model-copy Job 数量
+- `MAX_CONCURRENT_JOBS` 仅在设置为正整数时才会限制同时运行的 model-copy Job 数量；`0` 表示不限制

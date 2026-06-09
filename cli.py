@@ -102,7 +102,7 @@ def add_common_runtime_args(parser: argparse.ArgumentParser) -> None:
         "--max-concurrent-jobs",
         type=int,
         default=defaults.max_concurrent_jobs,
-        help=f"允许同时运行的 Job 上限，默认: {defaults.max_concurrent_jobs}",
+        help=f"允许同时运行的 Job 上限，默认: {defaults.max_concurrent_jobs}（0 表示不限制）",
     )
     parser.add_argument(
         "--request-timeout",
@@ -144,7 +144,7 @@ def build_parser() -> argparse.ArgumentParser:
     list_parser = subparsers.add_parser("list", help="列出已管理模型与 Triton repository/index")
     add_common_runtime_args(list_parser)
 
-    unload_parser = subparsers.add_parser("unload", help="按 alias、模型名或指定版本卸载")
+    unload_parser = subparsers.add_parser("unload", help="按 alias 或模型名卸载")
     add_common_runtime_args(unload_parser)
     unload_parser.add_argument("--aliases", nargs="*", default=[], help="要卸载的 alias 列表")
     unload_parser.add_argument("--models", nargs="*", default=[], help="要卸载的模型名列表")
@@ -152,7 +152,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--versions",
         nargs="*",
         default=[],
-        help="要卸载的版本列表，格式: model_name@123",
+        help="已废弃；同名模型不再支持按版本管理和卸载",
     )
 
     reload_parser = subparsers.add_parser("reload", help="重载指定模型")
@@ -253,15 +253,15 @@ def execute(args: argparse.Namespace) -> int:
 
     if args.command == "unload":
         if not args.aliases and not args.models and not args.versions:
-            raise HotLoaderError("unload 至少要提供 --aliases、--models 或 --versions 之一")
+            raise HotLoaderError("unload 至少要提供 --aliases 或 --models 之一")
+        if args.versions:
+            raise HotLoaderError("同名模型已取消版本管理，请改用 --models 或 --aliases")
 
         payload = {}
         if args.aliases:
             payload["alias_result"] = loader.unload_aliases(args.aliases)
         if args.models:
             payload["model_result"] = loader.unload_models(args.models)
-        if args.versions:
-            payload["version_result"] = loader.unload_model_versions(args.versions)
 
         if len(payload) == 1:
             print_json(next(iter(payload.values())))

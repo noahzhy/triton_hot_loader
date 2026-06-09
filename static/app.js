@@ -16,10 +16,15 @@ const jobNameInput = document.getElementById("job-name-input");
 const actionModelNameInput = document.getElementById("action-model-name");
 const tritonUrlInput = document.getElementById("triton-url-input");
 const metricsPortInput = document.getElementById("metrics-port-input");
+const operationStatusPanel = document.getElementById("operation-status-panel");
+const operationStatusCaption = document.getElementById("operation-status-caption");
+const operationStatusBadge = document.getElementById("operation-status-badge");
+const operationStatusTitle = document.getElementById("operation-status-title");
+const operationStatusDetail = document.getElementById("operation-status-detail");
 
 const TRITON_URL_STORAGE_KEY = "hot_triton_triton_url";
 const METRICS_PORT_STORAGE_KEY = "hot_triton_metrics_port";
-const GPU_STATUS_POLL_INTERVAL_MS = 5000;
+const AUTO_REFRESH_INTERVAL_MS = 5000;
 const MAX_JOB_LIST_ITEMS = 50;
 const API_ROUTES = {
     status: "/api/status",
@@ -34,6 +39,27 @@ const API_ROUTES = {
 };
 let tritonRepositoryModels = [];
 const selectedTritonModels = new Set();
+let refreshInFlight = false;
+let autoRefreshTimerId = null;
+let operationInFlightCount = 0;
+let operationTimerId = null;
+let operationStartedAt = 0;
+let currentOperationLabel = "";
+let currentOperationButton = null;
+let collapsiblePanelsInitialized = false;
+
+const INTERACTIVE_BUTTON_IDS = [
+    "refresh-all-btn",
+    "load-model-btn",
+    "load-batch-btn",
+    "job-status-btn",
+    "unload-model-btn",
+    "reload-model-btn",
+    "load-sample-btn",
+    "save-triton-url-btn",
+    "reset-triton-url-btn",
+    "bulk-unload-triton-btn",
+];
 
 function getOverrideHeaders() {
     const headers = {};
@@ -66,6 +92,47 @@ function renderJson(payload) {
     resultPanel.textContent = JSON.stringify(payload, null, 2);
 }
 
+function assertBusinessSuccess(result, fallbackMessage = "操作失败") {
+    if (!result || result.success !== false) {
+        return;
+    }
+    const errors = Array.isArray(result.errors)
+        ? result.errors
+            .map((item) => item?.error || item?.detail || item?.status || "")
+            .filter(Boolean)
+        : [];
+    const error = new Error(errors.join("；") || result.detail || result.error || fallbackMessage);
+    error.payload = result;
+    throw error;
+}
+
+function clearFieldOptimistically(field) {
+    if (!(field instanceof HTMLInputElement) && !(field instanceof HTMLTextAreaElement)) {
+        return () => {};
+    }
+
+    const previousValue = field.value;
+    field.value = "";
+    return () => {
+        field.value = previousValue;
+    };
+}
+
+function formatDurationLabel(startedAt) {
+    if (!startedAt) {
+        return "0s";
+    }
+
+    const seconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+    if (seconds < 60) {
+        return `${seconds}s`;
+    }
+
+    const minutes = Math.floor(seconds / 60);
+    const remainSeconds = seconds % 60;
+    return `${minutes}m ${remainSeconds}s`;
+}
+
 function toFiniteNumber(value) {
     return Number.isFinite(value) ? value : null;
 }
@@ -92,6 +159,11 @@ function formatWatts(value, digits = 1) {
 function formatMemoryMb(value) {
     const normalized = toFiniteNumber(value);
     return normalized === null ? "-" : `${normalized.toLocaleString("zh-CN")} MB`;
+}
+
+function bytesToMb(value) {
+    const normalized = toFiniteNumber(value);
+    return normalized === null ? null : normalized / (1024 * 1024);
 }
 
 function formatMemoryGb(value, digits = 1) {
@@ -206,6 +278,195 @@ function updateTritonSelectionControls(visibleModels) {
         selectAllTritonModelsCheckbox.indeterminate =
             selectedVisibleCount > 0 && selectedVisibleCount < visibleModelNames.length;
     }
+}
+
+function setInteractiveButtonsDisabled(disabled) {
+    INTERACTIVE_BUTTON_IDS.forEach((id) => {
+        const element = document.getElementById(id);
+        if (!(element instanceof HTMLButtonElement)) {
+            return;
+        }
+        element.disabled = disabled;
+    });
+}
+
+function clearPendingButtonState() {
+    if (!(currentOperationButton instanceof HTMLButtonElement)) {
+        currentOperationButton = null;
+        return;
+    }
+
+    if (currentOperationButton.dataset.originalLabel) {
+        currentOperationButton.textContent = currentOperationButton.dataset.originalLabel;
+        delete currentOperationButton.dataset.originalLabel;
+    }
+    currentOperationButton.classList.remove("is-pending");
+    currentOperationButton = null;
+}
+
+function setPendingButtonState(buttonId) {
+    clearPendingButtonState();
+
+    const button = buttonId ? document.getElementById(buttonId) : null;
+    if (!(button instanceof HTMLButtonElement)) {
+        return;
+    }
+
+    currentOperationButton = button;
+    button.dataset.originalLabel = button.textContent || "";
+    button.textContent = `${button.dataset.originalLabel}...`;
+    button.classList.add("is-pending");
+}
+
+function stopOperationTicker() {
+    if (operationTimerId !== null) {
+        window.clearInterval(operationTimerId);
+        operationTimerId = null;
+    }
+}
+
+function setCollapsiblePanelExpanded(button, expanded) {
+    if (!(button instanceof HTMLButtonElement)) {
+        return;
+    }
+
+    const targetId = button.dataset.collapseTarget || "";
+    const target = targetId ? document.getElementById(targetId) : null;
+    const panel = button.closest(".panel-collapsible");
+    const label = button.querySelector(".panel-collapse-label");
+
+    button.setAttribute("aria-expanded", expanded ? "true" : "false");
+    if (target) {
+        target.hidden = !expanded;
+    }
+    if (panel) {
+        panel.classList.toggle("is-collapsed", !expanded);
+    }
+    if (label) {
+        label.textContent = expanded ? "收起" : "展开";
+    }
+}
+
+function initCollapsiblePanels() {
+    if (collapsiblePanelsInitialized) {
+        return;
+    }
+
+    document.querySelectorAll(".panel-collapse-toggle").forEach((button) => {
+        if (!(button instanceof HTMLButtonElement)) {
+            return;
+        }
+
+        setCollapsiblePanelExpanded(button, false);
+        button.addEventListener("click", () => {
+            const expanded = button.getAttribute("aria-expanded") === "true";
+            setCollapsiblePanelExpanded(button, !expanded);
+        });
+    });
+
+    collapsiblePanelsInitialized = true;
+}
+
+function renderIdleOperationState() {
+    stopOperationTicker();
+    currentOperationLabel = "";
+    clearPendingButtonState();
+    if (operationStatusPanel) {
+        operationStatusPanel.classList.remove("is-running", "is-success", "is-error");
+        operationStatusPanel.classList.add("is-idle");
+    }
+    if (operationStatusCaption) {
+        operationStatusCaption.textContent = "等待操作。";
+    }
+    if (operationStatusBadge) {
+        operationStatusBadge.textContent = "Idle";
+        operationStatusBadge.className = "mini-badge muted";
+    }
+    if (operationStatusTitle) {
+        operationStatusTitle.textContent = "暂无进行中的任务";
+    }
+    if (operationStatusDetail) {
+        operationStatusDetail.textContent = "提交加载、卸载或查询后，这里会显示当前进度。";
+    }
+}
+
+function renderRunningOperationState(label) {
+    currentOperationLabel = label;
+    operationStartedAt = Date.now();
+    if (operationStatusPanel) {
+        operationStatusPanel.classList.remove("is-idle", "is-success", "is-error");
+        operationStatusPanel.classList.add("is-running");
+    }
+    if (operationStatusCaption) {
+        operationStatusCaption.textContent = "请求已发出，正在等待服务端完成。";
+    }
+    if (operationStatusBadge) {
+        operationStatusBadge.textContent = "Running";
+        operationStatusBadge.className = "mini-badge active";
+    }
+    if (operationStatusTitle) {
+        operationStatusTitle.textContent = label;
+    }
+    if (operationStatusDetail) {
+        operationStatusDetail.textContent = `已运行 ${formatDurationLabel(operationStartedAt)}`;
+    }
+
+    stopOperationTicker();
+    operationTimerId = window.setInterval(() => {
+        if (operationStatusDetail) {
+            operationStatusDetail.textContent = `已运行 ${formatDurationLabel(operationStartedAt)}`;
+        }
+    }, 1000);
+}
+
+function renderFinishedOperationState(type, detail) {
+    stopOperationTicker();
+    if (operationStatusPanel) {
+        operationStatusPanel.classList.remove("is-idle", "is-running", "is-success", "is-error");
+        operationStatusPanel.classList.add(type === "success" ? "is-success" : "is-error");
+    }
+    if (operationStatusCaption) {
+        operationStatusCaption.textContent = type === "success" ? "本次操作已完成。" : "本次操作失败。";
+    }
+    if (operationStatusBadge) {
+        operationStatusBadge.textContent = type === "success" ? "Done" : "Error";
+        operationStatusBadge.className = `mini-badge ${type === "success" ? "active" : "error"}`;
+    }
+    if (operationStatusTitle) {
+        operationStatusTitle.textContent = currentOperationLabel || (type === "success" ? "操作完成" : "操作失败");
+    }
+    if (operationStatusDetail) {
+        operationStatusDetail.textContent = detail || (type === "success" ? "已完成。" : "请求失败。");
+    }
+}
+
+function buildGpuStatusPayloadFromMetrics(metrics) {
+    const normalizedMetrics = metrics && typeof metrics === "object" ? metrics : {};
+    const available = Boolean(normalizedMetrics.available);
+    const gpus = Array.isArray(normalizedMetrics.gpus) ? normalizedMetrics.gpus : [];
+
+    return {
+        status: available ? "OK" : "UNAVAILABLE",
+        detail: normalizedMetrics.detail || (available ? "OK" : "未获取到 GPU 指标"),
+        source_url: normalizedMetrics.url || "",
+        updated_at: normalizedMetrics.updated_at || "",
+        gpus: gpus.map((gpu) => ({
+            gpu_index: gpu.index,
+            gpu_uuid: gpu.gpu_uuid,
+            gpu_bus_id: gpu.gpu_bus_id,
+            memory_total_mb: bytesToMb(gpu.total_bytes),
+            memory_used_mb: bytesToMb(gpu.used_bytes),
+            memory_free_mb:
+                toFiniteNumber(gpu.total_bytes) !== null && toFiniteNumber(gpu.used_bytes) !== null
+                    ? bytesToMb(gpu.total_bytes - gpu.used_bytes)
+                    : null,
+            memory_used_percent: gpu.used_percent,
+            gpu_utilization_percent: gpu.utilization_percent,
+            power_draw_w: gpu.power_usage_watts,
+            power_limit_w: null,
+            temperature_c: null,
+        })),
+    };
 }
 
 function renderGpuStatus(payload) {
@@ -463,56 +724,84 @@ function renderTritonModels(payload) {
         .join("");
 }
 
-async function refreshAll() {
-    const [statusPayload, modelsPayload] = await Promise.all([
-        fetchJson(API_ROUTES.status),
-        fetchJson(API_ROUTES.modelsOverview),
-    ]);
-    renderStatusSummary(statusPayload);
-    renderJobs(statusPayload);
-    renderManagedModels(modelsPayload);
-    renderTritonModels(modelsPayload);
-    await refreshGpuStatus();
+async function refreshAll({ background = false } = {}) {
+    if (refreshInFlight) {
+        return;
+    }
+
+    refreshInFlight = true;
+    try {
+        const statusPayload = await fetchJson(API_ROUTES.status);
+        renderStatusSummary(statusPayload);
+        renderJobs(statusPayload);
+        renderManagedModels(statusPayload);
+        renderTritonModels(statusPayload);
+        renderGpuStatus(buildGpuStatusPayloadFromMetrics(statusPayload?.triton?.metrics));
+        return statusPayload;
+    } catch (error) {
+        if (!background) {
+            throw error;
+        }
+    } finally {
+        refreshInFlight = false;
+    }
 }
 
-async function refreshGpuStatus() {
-    try {
-        const payload = await fetchJson(API_ROUTES.gpuStatus);
-        renderGpuStatus(payload);
-    } catch (error) {
-        renderGpuStatus({
-            status: "UNAVAILABLE",
-            detail: error.message,
-            source_url: "",
-            updated_at: new Date().toISOString(),
-            gpus: [],
-        });
+function startAutoRefreshLoop() {
+    const tick = async () => {
+        if (operationInFlightCount === 0 && !refreshInFlight) {
+            await refreshAll({ background: true });
+        }
+        autoRefreshTimerId = window.setTimeout(tick, AUTO_REFRESH_INTERVAL_MS);
+    };
+
+    if (autoRefreshTimerId !== null) {
+        window.clearTimeout(autoRefreshTimerId);
     }
+    autoRefreshTimerId = window.setTimeout(tick, AUTO_REFRESH_INTERVAL_MS);
 }
 
 async function submitSingleLoad() {
-    const payload = {
-        image: singleImageInput.value.trim(),
-    };
-    const result = await fetchJson(API_ROUTES.loadModel, {
-        method: "POST",
-        body: JSON.stringify(payload),
-    });
-    if (result.job_name) {
-        jobNameInput.value = result.job_name;
+    const image = singleImageInput.value.trim();
+    if (!image) {
+        throw new Error("请先输入 image");
     }
-    renderJson(result);
-    await refreshAll();
+
+    const restoreInput = clearFieldOptimistically(singleImageInput);
+    try {
+        const result = await fetchJson(API_ROUTES.loadModel, {
+            method: "POST",
+            body: JSON.stringify({ image, wait_for_ready: false }),
+        });
+        if (result.job_name) {
+            jobNameInput.value = result.job_name;
+        }
+        renderJson(result);
+        await refreshAll();
+    } catch (error) {
+        restoreInput();
+        throw error;
+    }
 }
 
 async function submitBatchLoad() {
-    const payload = JSON.parse(batchInput.value);
-    const result = await fetchJson(API_ROUTES.loadModelBatch, {
-        method: "POST",
-        body: JSON.stringify(payload),
-    });
-    renderJson(result);
-    await refreshAll();
+    const payload = {
+        ...JSON.parse(batchInput.value),
+        wait_for_ready: false,
+    };
+    const restoreInput = clearFieldOptimistically(batchInput);
+    try {
+        const result = await fetchJson(API_ROUTES.loadModelBatch, {
+            method: "POST",
+            body: JSON.stringify(payload),
+        });
+        assertBusinessSuccess(result, "批量任务提交失败");
+        renderJson(result);
+        await refreshAll();
+    } catch (error) {
+        restoreInput();
+        throw error;
+    }
 }
 
 async function queryJobStatus() {
@@ -530,12 +819,19 @@ async function unloadModel() {
     if (!modelName) {
         throw new Error("请先输入 model_name");
     }
-    const result = await fetchJson(API_ROUTES.unloadModel, {
-        method: "POST",
-        body: JSON.stringify({ model_name: modelName }),
-    });
-    renderJson(result);
-    await refreshAll();
+
+    const restoreInput = clearFieldOptimistically(actionModelNameInput);
+    try {
+        const result = await fetchJson(API_ROUTES.unloadModel, {
+            method: "POST",
+            body: JSON.stringify({ model_name: modelName }),
+        });
+        renderJson(result);
+        await refreshAll();
+    } catch (error) {
+        restoreInput();
+        throw error;
+    }
 }
 
 async function unloadSelectedTritonModels() {
@@ -555,6 +851,7 @@ async function unloadSelectedTritonModels() {
         method: "POST",
         body: JSON.stringify({ models }),
     });
+    assertBusinessSuccess(result, "批量热卸载失败");
     selectedTritonModels.clear();
     renderJson(result);
     await refreshAll();
@@ -565,12 +862,19 @@ async function reloadModel() {
     if (!modelName) {
         throw new Error("请先输入 model_name");
     }
-    const result = await fetchJson(API_ROUTES.reloadModel, {
-        method: "POST",
-        body: JSON.stringify({ model_name: modelName }),
-    });
-    renderJson(result);
-    await refreshAll();
+
+    const restoreInput = clearFieldOptimistically(actionModelNameInput);
+    try {
+        const result = await fetchJson(API_ROUTES.reloadModel, {
+            method: "POST",
+            body: JSON.stringify({ model_name: modelName }),
+        });
+        renderJson(result);
+        await refreshAll();
+    } catch (error) {
+        restoreInput();
+        throw error;
+    }
 }
 
 function loadSampleBatch() {
@@ -602,24 +906,78 @@ function resetOverrides() {
     metricsPortInput.value = "";
 }
 
-async function withResult(action) {
+async function withResult(action, pendingMessage = "", options = {}) {
+    const {
+        operationLabel = pendingMessage || "正在执行操作...",
+        buttonId = null,
+        renderActionResult = false,
+        renderPendingResult = Boolean(pendingMessage),
+        successDetail = "服务端已经返回结果，页面状态已同步刷新。",
+    } = options;
+    operationInFlightCount += 1;
+    setPendingButtonState(buttonId);
+    setInteractiveButtonsDisabled(true);
+    renderRunningOperationState(operationLabel);
+    if (renderPendingResult && pendingMessage) {
+        renderJson({ success: true, detail: pendingMessage });
+    }
     try {
-        await action();
+        const actionResult = await action();
+        if (renderActionResult && actionResult !== undefined) {
+            renderJson(actionResult);
+        }
+        renderFinishedOperationState("success", successDetail);
     } catch (error) {
-        renderJson({ success: false, detail: error.message });
+        renderJson(error.payload || { success: false, detail: error.message });
+        renderFinishedOperationState("error", error.message);
+    } finally {
+        operationInFlightCount = Math.max(0, operationInFlightCount - 1);
+        setInteractiveButtonsDisabled(false);
+        clearPendingButtonState();
+        updateTritonSelectionControls(getFilteredTritonModels());
     }
 }
 
-document.getElementById("refresh-all-btn")?.addEventListener("click", () => withResult(refreshAll));
-document.getElementById("load-model-btn")?.addEventListener("click", () => withResult(submitSingleLoad));
-document.getElementById("load-batch-btn")?.addEventListener("click", () => withResult(submitBatchLoad));
-document.getElementById("job-status-btn")?.addEventListener("click", () => withResult(queryJobStatus));
-document.getElementById("unload-model-btn")?.addEventListener("click", () => withResult(unloadModel));
-document.getElementById("reload-model-btn")?.addEventListener("click", () => withResult(reloadModel));
+document.getElementById("refresh-all-btn")?.addEventListener("click", () =>
+    withResult(() => refreshAll(), "", {
+        operationLabel: "刷新控制器与 Triton 状态",
+        buttonId: "refresh-all-btn",
+        renderActionResult: true,
+        successDetail: "控制器与 Triton 状态已刷新。",
+    }),
+);
+document.getElementById("load-model-btn")?.addEventListener("click", () =>
+    withResult(submitSingleLoad, "正在创建加载任务...", {
+        operationLabel: "创建单模型加载任务",
+        buttonId: "load-model-btn",
+        successDetail: "任务已提交，后续进度会在 Job 列表中继续刷新。",
+    }),
+);
+document.getElementById("load-batch-btn")?.addEventListener("click", () =>
+    withResult(submitBatchLoad, "正在批量创建任务...", {
+        operationLabel: "创建批量加载任务",
+        buttonId: "load-batch-btn",
+        successDetail: "批量任务已提交，后续进度会在 Job 列表中继续刷新。",
+    }),
+);
+document.getElementById("job-status-btn")?.addEventListener("click", () =>
+    withResult(queryJobStatus, "正在查询 Job 状态...", { operationLabel: "查询指定 Job 状态", buttonId: "job-status-btn" }),
+);
+document.getElementById("unload-model-btn")?.addEventListener("click", () =>
+    withResult(unloadModel, "正在卸载模型...", { operationLabel: "执行模型卸载", buttonId: "unload-model-btn" }),
+);
+document.getElementById("reload-model-btn")?.addEventListener("click", () =>
+    withResult(reloadModel, "正在重载模型...", { operationLabel: "执行模型重载", buttonId: "reload-model-btn" }),
+);
 document.getElementById("load-sample-btn")?.addEventListener("click", loadSampleBatch);
 document.getElementById("save-triton-url-btn")?.addEventListener("click", saveOverrides);
 document.getElementById("reset-triton-url-btn")?.addEventListener("click", resetOverrides);
-bulkUnloadTritonBtn?.addEventListener("click", () => withResult(unloadSelectedTritonModels));
+bulkUnloadTritonBtn?.addEventListener("click", () =>
+    withResult(unloadSelectedTritonModels, "正在批量热卸载模型...", {
+        operationLabel: "执行批量热卸载",
+        buttonId: "bulk-unload-triton-btn",
+    }),
+);
 tritonModelFilterInput?.addEventListener("input", () => renderTritonModels());
 clearTritonModelFilterBtn?.addEventListener("click", () => {
     tritonModelFilterInput.value = "";
@@ -658,11 +1016,10 @@ tritonModelBody?.addEventListener("change", (event) => {
 tritonUrlInput.value = localStorage.getItem(TRITON_URL_STORAGE_KEY) || "";
 metricsPortInput.value = localStorage.getItem(METRICS_PORT_STORAGE_KEY) || "";
 loadSampleBatch();
-withResult(refreshAll);
-refreshGpuStatus();
-window.setInterval(() => {
-    withResult(refreshAll);
-}, 10000);
-window.setInterval(() => {
-    refreshGpuStatus();
-}, GPU_STATUS_POLL_INTERVAL_MS);
+initCollapsiblePanels();
+renderIdleOperationState();
+refreshAll().catch((error) => {
+    renderJson({ success: false, detail: error.message });
+    renderFinishedOperationState("error", error.message);
+});
+startAutoRefreshLoop();

@@ -4,11 +4,13 @@ import json
 import os
 import re
 import shutil
+import threading
 import time
 import uuid
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, List, Mapping, Sequence
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -71,11 +73,33 @@ _EXPLICIT_CONTROL_HINT = (
     "tritonserver --model-repository=/repository/trt_models --model-control-mode=EXPLICIT --repository-poll-secs=0"
 )
 
-_SYNC_LOAD_SUCCESS_STATUSES = {"MODEL_READY", "TRITON_RELOAD_SUCCEEDED"}
+_SYNC_LOAD_SUCCESS_STATUSES = {"MODEL_READY"}
 _SYNC_LOAD_FAILURE_STATUSES = {"COPY_FAILED", "TRITON_RELOAD_FAILED"}
 _SYNC_LOAD_TERMINAL_STATUSES = _SYNC_LOAD_SUCCESS_STATUSES | _SYNC_LOAD_FAILURE_STATUSES
 _SYNC_LOAD_DEFAULT_TIMEOUT_SECONDS = 600.0
 _SYNC_LOAD_DEFAULT_POLL_INTERVAL_SECONDS = 2.0
+_ACTIVE_JOB_STATUSES = {
+    "JOB_CREATED",
+    "SCHEDULING",
+    "IMAGE_PULLING",
+    "COPY_RUNNING",
+    "COPY_SUCCEEDED",
+    "TRITON_RELOAD_RUNNING",
+}
+_STATUS_ACTIVE_JOB_REFRESH_LIMIT = 6
+
+_STATE_LOCKS_GUARD = threading.Lock()
+_STATE_LOCKS: Dict[str, threading.RLock] = {}
+
+
+def _state_lock_for(state_file: Path) -> threading.RLock:
+    state_key = str(state_file.expanduser().resolve(strict=False))
+    with _STATE_LOCKS_GUARD:
+        lock = _STATE_LOCKS.get(state_key)
+        if lock is None:
+            lock = threading.RLock()
+            _STATE_LOCKS[state_key] = lock
+        return lock
 
 
 def _load_dotenv_values(env_file: Path) -> Dict[str, str]:
@@ -153,9 +177,12 @@ def _derive_job_volume_mount_path(model_target_path: str) -> str:
 
     posix_path = PurePosixPath(normalized)
     parent = str(posix_path.parent)
-    if normalized.startswith("/") and parent not in {"", ".", "/"}:
-        return parent
-    return str(posix_path)
+    return parent if normalized.startswith("/") and parent not in {"", ".", "/"} else str(posix_path)
+
+
+def _derive_job_staging_root(model_target_path: str) -> str:
+    mount_path = _derive_job_volume_mount_path(model_target_path).rstrip("/")
+    return f"{mount_path}/.staging" if mount_path else "/.staging"
 
 
 def _normalize_host_for_url(host: str) -> str:
@@ -305,7 +332,7 @@ class HotLoaderConfig:
     model_copy_memory_request: str = "256Mi"
     model_copy_cpu_limit: str = "1"
     model_copy_memory_limit: str = "1Gi"
-    max_concurrent_jobs: int = 1
+    max_concurrent_jobs: int = 0
     job_image_pull_policy: str = "IfNotPresent"
     job_tolerations: List[Dict[str, Any]] = field(default_factory=list)
     request_timeout: float = 60.0
@@ -345,7 +372,7 @@ class HotLoaderConfig:
             model_copy_memory_request=_env_default(*_MODEL_COPY_MEMORY_REQUEST_ENV_NAMES) or "256Mi",
             model_copy_cpu_limit=_env_default(*_MODEL_COPY_CPU_LIMIT_ENV_NAMES) or "1",
             model_copy_memory_limit=_env_default(*_MODEL_COPY_MEMORY_LIMIT_ENV_NAMES) or "1Gi",
-            max_concurrent_jobs=int(_env_default(*_MAX_CONCURRENT_JOBS_ENV_NAMES) or "1"),
+            max_concurrent_jobs=int(_env_default(*_MAX_CONCURRENT_JOBS_ENV_NAMES) or "0"),
             job_image_pull_policy=_env_default(*_JOB_IMAGE_PULL_POLICY_ENV_NAMES) or "IfNotPresent",
             job_tolerations=_parse_job_tolerations(
                 _env_default(*_JOB_TOLERATIONS_ENV_NAMES),
@@ -388,6 +415,7 @@ class TritonHotLoader:
 
     def __init__(self, config: HotLoaderConfig | None = None) -> None:
         self.config = config or HotLoaderConfig.default()
+        self._state_lock = _state_lock_for(self.config.state_file)
         self._batch_v1_api: Any | None = None
         self._core_v1_api: Any | None = None
         self._ensure_runtime_dirs()
@@ -404,13 +432,14 @@ class TritonHotLoader:
         return {"aliases": {}, "jobs": {}, "updated_at": None}
 
     def _load_state(self) -> Dict[str, Any]:
-        if not self.config.state_file.exists():
-            return self._empty_state()
-        try:
-            with self.config.state_file.open("r", encoding="utf-8") as handle:
-                data = json.load(handle)
-        except json.JSONDecodeError as exc:
-            raise HotLoaderError(f"状态文件不是合法 JSON: {self.config.state_file}") from exc
+        with self._state_lock:
+            if not self.config.state_file.exists():
+                return self._empty_state()
+            try:
+                with self.config.state_file.open("r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+            except json.JSONDecodeError as exc:
+                raise HotLoaderError(f"状态文件不是合法 JSON: {self.config.state_file}") from exc
 
         if not isinstance(data, dict):
             raise HotLoaderError(f"状态文件格式错误: {self.config.state_file}")
@@ -430,10 +459,13 @@ class TritonHotLoader:
         }
 
     def _save_state(self, state: Dict[str, Any]) -> None:
-        temp_file = self.config.state_file.with_suffix(".tmp")
-        with temp_file.open("w", encoding="utf-8") as handle:
-            json.dump(state, handle, ensure_ascii=False, indent=2, sort_keys=True)
-        temp_file.replace(self.config.state_file)
+        with self._state_lock:
+            temp_file = self.config.state_file.with_name(
+                f"{self.config.state_file.name}.{uuid.uuid4().hex}.tmp"
+            )
+            with temp_file.open("w", encoding="utf-8") as handle:
+                json.dump(state, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            temp_file.replace(self.config.state_file)
 
     @staticmethod
     def _utc_now() -> str:
@@ -516,9 +548,74 @@ class TritonHotLoader:
         return f"model-copy-{normalized_model_name}-{suffix}"[:63].rstrip("-")
 
     @staticmethod
-    def _bundle_key_for_model_image(model_name: str, image_ref: str) -> str:
-        digest = hashlib.sha1(f"{model_name}\0{image_ref}".encode("utf-8")).hexdigest()[:12]
-        return f"model_{model_name}_{digest}"
+    def _alias_for_model(model_name: str) -> str:
+        return f"model_{model_name}"
+
+    @staticmethod
+    def _parse_iso_datetime(value: str) -> datetime | None:
+        candidate = value.strip()
+        if not candidate:
+            return None
+        try:
+            return datetime.fromisoformat(candidate)
+        except ValueError:
+            return None
+
+    def _normalize_callback_config(self, callback: Mapping[str, Any] | None) -> Dict[str, Any] | None:
+        if callback is None:
+            return None
+        if not isinstance(callback, Mapping):
+            raise HotLoaderError("callback 必须是对象")
+
+        url = str(callback.get("url") or "").strip()
+        parts = urlsplit(url)
+        if parts.scheme not in {"http", "https"} or not parts.netloc:
+            raise HotLoaderError("callback.url 必须是合法的 http/https URL")
+
+        raw_events = callback.get("events")
+        if raw_events is None:
+            events = ["terminal"]
+        elif isinstance(raw_events, Sequence) and not isinstance(raw_events, (str, bytes)):
+            events = sorted(
+                {
+                    str(item).strip().lower()
+                    for item in raw_events
+                    if str(item).strip()
+                }
+            )
+        else:
+            raise HotLoaderError("callback.events 必须是字符串数组")
+
+        if not events:
+            events = ["terminal"]
+        if any(event != "terminal" for event in events):
+            raise HotLoaderError("callback.events 目前只支持 terminal")
+
+        token = str(callback.get("token") or "").strip() or None
+        return {
+            "url": url,
+            "events": events,
+            "token": token,
+            "attempts": 0,
+            "delivered_at": None,
+            "last_attempt_at": None,
+            "last_error": None,
+            "last_event_id": None,
+            "next_attempt_at": None,
+        }
+
+    @staticmethod
+    def _sanitize_callback_config(callback: Mapping[str, Any]) -> Dict[str, Any]:
+        sanitized = dict(callback)
+        sanitized.pop("token", None)
+        return sanitized
+
+    def _sanitize_job_metadata(self, meta: Mapping[str, Any]) -> Dict[str, Any]:
+        sanitized = dict(meta)
+        callback = sanitized.get("callback")
+        if isinstance(callback, Mapping):
+            sanitized["callback"] = self._sanitize_callback_config(callback)
+        return sanitized
 
     def _find_state_entry_by_model(
         self,
@@ -906,8 +1003,8 @@ class TritonHotLoader:
         return active
 
     def _assert_job_capacity(self) -> None:
-        if self.config.max_concurrent_jobs < 1:
-            raise HotLoaderError("MAX_CONCURRENT_JOBS 必须大于等于 1")
+        if self.config.max_concurrent_jobs <= 0:
+            return
         active = self._active_job_count()
         if active >= self.config.max_concurrent_jobs:
             raise HotLoaderError(
@@ -917,6 +1014,7 @@ class TritonHotLoader:
     def _build_job_manifest(self, job_name: str, model_name: str, image_ref: str) -> Dict[str, Any]:
         model_label = self._normalize_k8s_name(model_name, limit=63) or "unknown-model"
         job_volume_mount_path = _derive_job_volume_mount_path(self.config.model_target_path)
+        job_staging_root = _derive_job_staging_root(self.config.model_target_path)
         copy_script = "\n".join(
             [
                 "set -eu",
@@ -934,9 +1032,19 @@ class TritonHotLoader:
                 "fi",
                 'echo "COPY_SOURCE=${COPY_SOURCE}"',
                 'TARGET_DIR="${MODEL_TARGET_PATH%/}/${MODEL_NAME}"',
-                'rm -rf "${TARGET_DIR}"',
-                'mkdir -p "${TARGET_DIR}"',
-                'cp -R "${COPY_SOURCE}/." "${TARGET_DIR}/"',
+                'STAGING_DIR="${STAGING_ROOT%/}/${MODEL_NAME}/${JOB_NAME}"',
+                'BACKUP_DIR="${STAGING_ROOT%/}/${MODEL_NAME}/${JOB_NAME}.backup"',
+                'rm -rf "${STAGING_DIR}" "${BACKUP_DIR}"',
+                'mkdir -p "$(dirname "${STAGING_DIR}")"',
+                'mkdir -p "${STAGING_DIR}"',
+                'cp -R "${COPY_SOURCE}/." "${STAGING_DIR}/"',
+                'if [ -d "${TARGET_DIR}" ]; then mv "${TARGET_DIR}" "${BACKUP_DIR}"; fi',
+                'if mv "${STAGING_DIR}" "${TARGET_DIR}"; then',
+                '  rm -rf "${BACKUP_DIR}"',
+                "else",
+                '  if [ -d "${BACKUP_DIR}" ] && [ ! -d "${TARGET_DIR}" ]; then mv "${BACKUP_DIR}" "${TARGET_DIR}" || true; fi',
+                "  exit 1",
+                "fi",
                 'echo "model copy done"',
             ]
         )
@@ -980,6 +1088,8 @@ class TritonHotLoader:
                                     {"name": "MODEL_NAME", "value": model_name},
                                     {"name": "MODEL_SOURCE_PATH", "value": self.config.model_source_path},
                                     {"name": "MODEL_TARGET_PATH", "value": self.config.model_target_path},
+                                    {"name": "STAGING_ROOT", "value": job_staging_root},
+                                    {"name": "JOB_NAME", "value": job_name},
                                 ],
                                 "command": ["/bin/sh", "-c"],
                                 "args": [copy_script],
@@ -1014,17 +1124,22 @@ class TritonHotLoader:
             },
         }
 
-    def _update_job_state(self, job_name: str, **updates: Any) -> Dict[str, Any]:
-        state = self._hydrate_state_aliases(self._load_state())
-        jobs = state.setdefault("jobs", {})
-        current = dict(jobs.get(job_name, {})) if isinstance(jobs.get(job_name), Mapping) else {}
-        current.update(updates)
-        current["job_name"] = job_name
-        current["updated_at"] = self._utc_now()
-        jobs[job_name] = current
-        state["updated_at"] = current["updated_at"]
-        self._save_state(state)
-        return current
+    def _update_job_state(self, job_name: str, *, touch_updated_at: bool = True, **updates: Any) -> Dict[str, Any]:
+        with self._state_lock:
+            state = self._hydrate_state_aliases(self._load_state())
+            jobs = state.setdefault("jobs", {})
+            current = dict(jobs.get(job_name, {})) if isinstance(jobs.get(job_name), Mapping) else {}
+            current.update(updates)
+            current["job_name"] = job_name
+            timestamp = self._utc_now()
+            if touch_updated_at or not current.get("updated_at"):
+                current["updated_at"] = timestamp
+                state["updated_at"] = current["updated_at"]
+            elif not state.get("updated_at"):
+                state["updated_at"] = current["updated_at"]
+            jobs[job_name] = current
+            self._save_state(state)
+            return current
 
     def _drop_model_from_aliases(self, aliases: Dict[str, Any], model_name: str) -> None:
         for alias, meta in list(aliases.items()):
@@ -1037,10 +1152,6 @@ class TritonHotLoader:
 
             if models:
                 hydrated["models"] = models
-                if isinstance(hydrated.get("model_versions"), dict):
-                    hydrated["model_versions"].pop(model_name, None)
-                if isinstance(hydrated.get("active_versions"), dict):
-                    hydrated["active_versions"].pop(model_name, None)
                 hydrated["updated_at"] = self._utc_now()
                 aliases[alias] = hydrated
             else:
@@ -1052,30 +1163,60 @@ class TritonHotLoader:
                 f"模型目录不存在: {self.config.model_repository / model_name}，请检查 Job 是否把文件复制到了 PVC"
             )
 
-        model_versions, active_versions = self._collect_model_version_metadata(
-            self.config.model_repository,
-            [model_name],
-        )
+        with self._state_lock:
+            state = self._hydrate_state_aliases(self._load_state())
+            aliases = state.setdefault("aliases", {})
+            alias = self._alias_for_model(model_name)
+            touched_aliases = {
+                current_alias
+                for current_alias, meta in aliases.items()
+                if isinstance(meta, Mapping) and model_name in meta.get("models", [])
+            }
+            touched_aliases.add(alias)
+            previous_aliases = {
+                current_alias: json.loads(json.dumps(aliases[current_alias], ensure_ascii=False))
+                for current_alias in touched_aliases
+                if current_alias in aliases
+            }
 
-        state = self._hydrate_state_aliases(self._load_state())
-        aliases = state.setdefault("aliases", {})
-        self._drop_model_from_aliases(aliases, model_name)
-        alias = self._bundle_key_for_model_image(model_name, image_ref)
-        aliases[alias] = {
-            "image": image_ref,
-            "models": [model_name],
-            "model_versions": model_versions,
-            "active_versions": active_versions,
-            "updated_at": self._utc_now(),
-        }
-        state["updated_at"] = self._utc_now()
-        self._save_state(state)
+            self._drop_model_from_aliases(aliases, model_name)
+            aliases[alias] = {
+                "image": image_ref,
+                "models": [model_name],
+                "updated_at": self._utc_now(),
+            }
+            state["updated_at"] = self._utc_now()
+            self._save_state(state)
 
         return {
             "alias": alias,
-            "model_versions": model_versions[model_name],
-            "active_version": active_versions[model_name],
+            "image": image_ref,
+            "model_name": model_name,
+            "previous_aliases": previous_aliases,
         }
+
+    def _rollback_loaded_model_registration(self, registration: Mapping[str, Any]) -> None:
+        alias = str(registration.get("alias") or "")
+        image_ref = str(registration.get("image") or "")
+        model_name = str(registration.get("model_name") or "")
+        previous_aliases = registration.get("previous_aliases", {})
+        if not alias or not image_ref or not model_name or not isinstance(previous_aliases, Mapping):
+            return
+
+        with self._state_lock:
+            state = self._hydrate_state_aliases(self._load_state())
+            aliases = state.setdefault("aliases", {})
+            current = aliases.get(alias)
+            if not isinstance(current, Mapping):
+                return
+            if current.get("image") != image_ref or current.get("models") != [model_name]:
+                return
+            aliases.pop(alias, None)
+            for previous_alias, previous_meta in previous_aliases.items():
+                if isinstance(previous_alias, str) and isinstance(previous_meta, Mapping):
+                    aliases[previous_alias] = dict(previous_meta)
+            state["updated_at"] = self._utc_now()
+            self._save_state(state)
 
     def _list_job_pods(self, job_name: str) -> List[Any]:
         core_api = self._get_core_v1_api()
@@ -1208,16 +1349,69 @@ class TritonHotLoader:
         cached_state = self._load_state().get("jobs", {}).get(job_name, {})
         if isinstance(cached_state, Mapping):
             final_status = cached_state.get("status")
-            if final_status in {"MODEL_READY", "TRITON_RELOAD_SUCCEEDED", "TRITON_RELOAD_FAILED"}:
+            if final_status in {"MODEL_READY", "TRITON_RELOAD_FAILED"}:
                 return dict(cached_state)
+            if final_status == "TRITON_RELOAD_RUNNING":
+                if self._model_ready_in_triton(model_name):
+                    return self._update_job_state(
+                        job_name,
+                        status="MODEL_READY",
+                        model_name=model_name,
+                        image=image_ref,
+                        detail="Triton 模型已完成 load/reload",
+                        triton_ready=True,
+                        error=None,
+                    )
+                reload_attempts = int(cached_state.get("triton_reload_attempts") or 0) + 1
+                reload_attempted_at = self._utc_now()
+                try:
+                    self._load_model(model_name)
+                    ready = self._model_ready_in_triton(model_name)
+                except Exception as exc:
+                    return self._update_job_state(
+                        job_name,
+                        status="TRITON_RELOAD_RUNNING",
+                        model_name=model_name,
+                        image=image_ref,
+                        detail=f"Triton 自动 reload 失败，将继续重试: {exc}",
+                        triton_ready=False,
+                        triton_reload_attempts=reload_attempts,
+                        triton_reload_last_attempt_at=reload_attempted_at,
+                        error=str(exc),
+                    )
+                return self._update_job_state(
+                    job_name,
+                    status="MODEL_READY" if ready else "TRITON_RELOAD_RUNNING",
+                    model_name=model_name,
+                    image=image_ref,
+                    detail=(
+                        "Triton 模型已完成 load/reload"
+                        if ready
+                        else f"已自动触发 Triton reload 第 {reload_attempts} 次，正在等待模型变为 READY"
+                    ),
+                    triton_ready=ready,
+                    triton_reload_attempts=reload_attempts,
+                    triton_reload_last_attempt_at=reload_attempted_at,
+                    error=None,
+                )
 
-        self._update_job_state(job_name, status="TRITON_RELOAD_RUNNING", model_name=model_name, image=image_ref)
+        registration = self._register_loaded_model(model_name, image_ref)
+        self._update_job_state(
+            job_name,
+            status="TRITON_RELOAD_RUNNING",
+            model_name=model_name,
+            image=image_ref,
+            alias=registration["alias"],
+            detail="模型文件复制完成，正在请求 Triton load",
+            triton_ready=False,
+            error=None,
+        )
         try:
-            registration = self._register_loaded_model(model_name, image_ref)
             self._load_model(model_name)
             ready = self._model_ready_in_triton(model_name)
         except Exception as exc:
-            failure = self._update_job_state(
+            self._rollback_loaded_model_registration(registration)
+            self._update_job_state(
                 job_name,
                 status="TRITON_RELOAD_FAILED",
                 model_name=model_name,
@@ -1228,18 +1422,26 @@ class TritonHotLoader:
 
         return self._update_job_state(
             job_name,
-            status="MODEL_READY" if ready else "TRITON_RELOAD_SUCCEEDED",
+            status="MODEL_READY" if ready else "TRITON_RELOAD_RUNNING",
             model_name=model_name,
             image=image_ref,
-            active_version=registration["active_version"],
-            model_versions=registration["model_versions"],
             alias=registration["alias"],
             triton_ready=ready,
+            triton_reload_attempts=1,
+            triton_reload_last_attempt_at=self._utc_now(),
+            detail="Triton 模型已完成 load/reload" if ready else "Triton 已收到 load 请求，正在等待模型变为 READY",
             error=None,
         )
 
-    def create_model_copy_job(self, model_name: str | None, image_ref: str) -> Dict[str, Any]:
+    def create_model_copy_job(
+        self,
+        model_name: str | None,
+        image_ref: str,
+        *,
+        callback: Mapping[str, Any] | None = None,
+    ) -> Dict[str, Any]:
         normalized_model_name, normalized_image_ref = self._resolve_model_name_for_image(model_name, image_ref)
+        callback_config = self._normalize_callback_config(callback)
         self._assert_job_capacity()
 
         job_name = self._job_name_for_model(normalized_model_name)
@@ -1260,6 +1462,7 @@ class TritonHotLoader:
             status="JOB_CREATED",
             model_name=normalized_model_name,
             image=normalized_image_ref,
+            callback=callback_config,
             namespace=self.config.k8s_namespace,
             job_uid=getattr(metadata, "uid", None),
             created_at=self._utc_now(),
@@ -1271,6 +1474,7 @@ class TritonHotLoader:
             "model_name": normalized_model_name,
             "image": normalized_image_ref,
             "status": "JOB_CREATED",
+            "callback_registered": bool(callback_config),
         }
 
     def wait_for_job_terminal_state(
@@ -1303,10 +1507,11 @@ class TritonHotLoader:
         model_name: str | None,
         image_ref: str,
         *,
+        callback: Mapping[str, Any] | None = None,
         timeout_seconds: float = _SYNC_LOAD_DEFAULT_TIMEOUT_SECONDS,
         poll_interval_seconds: float = _SYNC_LOAD_DEFAULT_POLL_INTERVAL_SECONDS,
     ) -> Dict[str, Any]:
-        submitted = self.create_model_copy_job(model_name, image_ref)
+        submitted = self.create_model_copy_job(model_name, image_ref, callback=callback)
         final_payload = self.wait_for_job_terminal_state(
             submitted["job_name"],
             timeout_seconds=timeout_seconds,
@@ -1321,7 +1526,12 @@ class TritonHotLoader:
             "success": success,
         }
 
-    def load_models_from_images(self, models: Iterable[Mapping[str, str]]) -> Dict[str, Any]:
+    def load_models_from_images(
+        self,
+        models: Iterable[Mapping[str, str]],
+        *,
+        callback: Mapping[str, Any] | None = None,
+    ) -> Dict[str, Any]:
         submitted: List[Dict[str, Any]] = []
         errors: List[Dict[str, Any]] = []
 
@@ -1333,7 +1543,13 @@ class TritonHotLoader:
             resolved_model_name = model_name
             try:
                 resolved_model_name, normalized_image_ref = self._resolve_model_name_for_image(model_name, image_ref)
-                submitted.append(self.create_model_copy_job(resolved_model_name, normalized_image_ref))
+                submitted.append(
+                    self.create_model_copy_job(
+                        resolved_model_name,
+                        normalized_image_ref,
+                        callback=callback,
+                    )
+                )
             except HotLoaderError as exc:
                 errors.append(
                     {
@@ -1350,7 +1566,12 @@ class TritonHotLoader:
             "state": self.get_managed_state(),
         }
 
-    def load_models_from_images_sync(self, models: Iterable[Mapping[str, str]]) -> Dict[str, Any]:
+    def load_models_from_images_sync(
+        self,
+        models: Iterable[Mapping[str, str]],
+        *,
+        callback: Mapping[str, Any] | None = None,
+    ) -> Dict[str, Any]:
         completed: List[Dict[str, Any]] = []
         errors: List[Dict[str, Any]] = []
 
@@ -1362,7 +1583,11 @@ class TritonHotLoader:
             resolved_model_name = model_name
             try:
                 resolved_model_name, normalized_image_ref = self._resolve_model_name_for_image(model_name, image_ref)
-                result = self.create_model_copy_job_and_wait(resolved_model_name, normalized_image_ref)
+                result = self.create_model_copy_job_and_wait(
+                    resolved_model_name,
+                    normalized_image_ref,
+                    callback=callback,
+                )
             except HotLoaderError as exc:
                 errors.append(
                     {
@@ -1393,7 +1618,7 @@ class TritonHotLoader:
             "state": self.get_managed_state(),
         }
 
-    def get_job_status(self, job_name: str) -> Dict[str, Any]:
+    def get_job_status(self, job_name: str, *, include_logs: bool = True) -> Dict[str, Any]:
         batch_api = self._get_batch_v1_api()
         cached_jobs = self._load_state().get("jobs", {})
         cached = dict(cached_jobs.get(job_name, {})) if isinstance(cached_jobs.get(job_name), Mapping) else {}
@@ -1405,8 +1630,41 @@ class TritonHotLoader:
             )
         except Exception as exc:
             if cached:
+                model_name = str(cached.get("model_name") or "")
+                image_ref = str(cached.get("image") or "")
+                cached_status = str(cached.get("status") or "").upper()
+                model_dir = self.config.model_repository / model_name if model_name else None
+                if (
+                    model_name
+                    and image_ref
+                    and cached_status in _ACTIVE_JOB_STATUSES
+                    and model_dir is not None
+                    and model_dir.exists()
+                ):
+                    try:
+                        finalized = self._finalize_successful_job(job_name, model_name, image_ref)
+                    except HotLoaderError as finalize_exc:
+                        finalized = self._update_job_state(
+                            job_name,
+                            status="TRITON_RELOAD_FAILED",
+                            model_name=model_name,
+                            image=image_ref,
+                            detail=str(finalize_exc),
+                            error=str(finalize_exc),
+                        )
+                    if str(finalized.get("status") or "").upper() == "TRITON_RELOAD_RUNNING":
+                        finalized = self._update_job_state(
+                            job_name,
+                            touch_updated_at=False,
+                            detail=(
+                                f"{str(finalized.get('detail') or '').strip()}；"
+                                "原始 Job 已不可读，按已落盘模型继续自动 reload"
+                            ).strip("；"),
+                        )
+                    return self._sanitize_job_metadata(finalized)
+
                 cached["detail"] = f"Job 当前不可读，可能已被 TTL 清理: {self._exception_text(exc)}"
-                return cached
+                return self._sanitize_job_metadata(cached)
             raise HotLoaderError(f"查询 Kubernetes Job 失败: {self._exception_text(exc)}") from exc
 
         pods = self._list_job_pods(job_name)
@@ -1423,33 +1681,35 @@ class TritonHotLoader:
             or getattr(getattr(job, "metadata", None), "annotations", {}).get("hot-loader/image-ref")
             or ""
         )
-        logs = self._read_pod_logs(pod_name)
+        logs = self._read_pod_logs(pod_name) if include_logs else cached.get("logs")
 
         if controller_status == "COPY_SUCCEEDED" and model_name and image_ref:
             try:
                 finalized = self._finalize_successful_job(job_name, model_name, image_ref)
                 controller_status = str(finalized.get("status") or controller_status)
-                detail = "Triton 模型已完成 load/reload" if controller_status == "MODEL_READY" else detail
+                detail = str(finalized.get("detail") or detail)
             except HotLoaderError as exc:
                 controller_status = "TRITON_RELOAD_FAILED"
                 detail = str(exc)
 
-        payload = self._update_job_state(
-            job_name,
-            status=controller_status,
-            detail=detail,
-            model_name=model_name,
-            image=image_ref,
-            pod_name=pod_name,
-            logs=logs,
-            events=events,
-        )
+        updates: Dict[str, Any] = {
+            "status": controller_status,
+            "detail": detail,
+            "model_name": model_name,
+            "image": image_ref,
+            "pod_name": pod_name,
+            "events": events,
+        }
+        if include_logs:
+            updates["logs"] = logs
+
+        payload = self._update_job_state(job_name, **updates)
         payload["job_name"] = job_name
         payload["model_name"] = model_name
         payload["pod_name"] = pod_name
         payload["logs"] = logs
         payload["events"] = events
-        return payload
+        return self._sanitize_job_metadata(payload)
 
     @staticmethod
     def _sort_versions(versions: Iterable[str]) -> List[str]:
@@ -1708,37 +1968,9 @@ class TritonHotLoader:
     def _hydrate_alias_metadata(self, meta: Mapping[str, Any]) -> Dict[str, Any]:
         hydrated = dict(meta)
         models = [model_name for model_name in hydrated.get("models", []) if isinstance(model_name, str)]
-        model_versions = {
-            model_name: versions
-            for model_name, versions in hydrated.get("model_versions", {}).items()
-            if isinstance(model_name, str) and isinstance(versions, list)
-        } if isinstance(hydrated.get("model_versions"), dict) else {}
-        active_versions = {
-            model_name: version
-            for model_name, version in hydrated.get("active_versions", {}).items()
-            if isinstance(model_name, str) and isinstance(version, str)
-        } if isinstance(hydrated.get("active_versions"), dict) else {}
-
-        missing_models = [
-            model_name
-            for model_name in models
-            if model_name not in model_versions or model_name not in active_versions
-        ]
-        for model_name in missing_models:
-            model_dir = self.config.model_repository / model_name
-            if not model_dir.exists():
-                continue
-            try:
-                versions = self._discover_model_versions(model_dir)
-            except HotLoaderError:
-                continue
-            model_versions.setdefault(model_name, versions)
-            active_versions.setdefault(model_name, self._select_active_version(versions))
-
-        if model_versions:
-            hydrated["model_versions"] = model_versions
-        if active_versions:
-            hydrated["active_versions"] = active_versions
+        hydrated["models"] = models
+        hydrated.pop("model_versions", None)
+        hydrated.pop("active_versions", None)
         return hydrated
 
     def get_managed_state(self) -> Dict[str, Any]:
@@ -1749,7 +1981,7 @@ class TritonHotLoader:
             if isinstance(meta, Mapping)
         }
         jobs = {
-            job_name: dict(meta)
+            job_name: self._sanitize_job_metadata(meta)
             for job_name, meta in state.get("jobs", {}).items()
             if isinstance(meta, Mapping)
         }
@@ -1759,13 +1991,11 @@ class TritonHotLoader:
                     "id": alias,
                     "image": meta.get("image"),
                     "models": meta.get("models", []),
-                    "model_versions": meta.get("model_versions", {}),
-                    "active_versions": meta.get("active_versions", {}),
                     "updated_at": meta.get("updated_at"),
                 }
                 for alias, meta in aliases.items()
             ],
-            key=lambda item: item.get("image") or "",
+            key=lambda item: (item.get("models") or [""])[0],
         )
         managed_models = sorted(
             {
@@ -1774,17 +2004,6 @@ class TritonHotLoader:
                 for model_name in meta.get("models", [])
             }
         )
-        managed_model_versions: Dict[str, List[str]] = {}
-        managed_active_versions: Dict[str, str] = {}
-        for meta in aliases.values():
-            if isinstance(meta.get("model_versions"), dict):
-                for model_name, versions in meta["model_versions"].items():
-                    if isinstance(versions, list):
-                        managed_model_versions[model_name] = versions
-            if isinstance(meta.get("active_versions"), dict):
-                for model_name, version in meta["active_versions"].items():
-                    if isinstance(version, str):
-                        managed_active_versions[model_name] = version
         return {
             "config": self.config.to_dict(),
             "updated_at": state.get("updated_at"),
@@ -1794,8 +2013,6 @@ class TritonHotLoader:
             "managed_image_count": len(managed_images),
             "managed_model_count": len(managed_models),
             "managed_models": managed_models,
-            "managed_model_versions": managed_model_versions,
-            "managed_active_versions": managed_active_versions,
             "jobs": jobs,
             "job_count": len(jobs),
             "active_jobs": sorted(
@@ -1803,23 +2020,144 @@ class TritonHotLoader:
                     job_name
                     for job_name, meta in jobs.items()
                     if str(meta.get("status") or "")
-                    in {
-                        "JOB_CREATED",
-                        "SCHEDULING",
-                        "IMAGE_PULLING",
-                        "COPY_RUNNING",
-                        "COPY_SUCCEEDED",
-                        "TRITON_RELOAD_RUNNING",
-                    }
+                    in _ACTIVE_JOB_STATUSES
                 ]
             ),
         }
 
+    def list_pending_terminal_callbacks(self, *, limit: int = 20) -> List[Dict[str, Any]]:
+        now = datetime.now(timezone.utc)
+        state = self._load_state()
+        jobs = state.get("jobs", {})
+        if not isinstance(jobs, Mapping):
+            return []
+
+        pending: List[Dict[str, Any]] = []
+        for job_name, meta in jobs.items():
+            if not isinstance(meta, Mapping):
+                continue
+            callback = meta.get("callback")
+            if not isinstance(callback, Mapping):
+                continue
+            if "terminal" not in callback.get("events", []):
+                continue
+            if str(meta.get("status") or "").upper() not in _SYNC_LOAD_TERMINAL_STATUSES:
+                continue
+            if str(callback.get("delivered_at") or "").strip():
+                continue
+
+            next_attempt_at = self._parse_iso_datetime(str(callback.get("next_attempt_at") or ""))
+            if next_attempt_at and next_attempt_at > now:
+                continue
+
+            pending.append({"job_name": job_name, **dict(meta)})
+
+        pending.sort(
+            key=lambda item: (
+                str(item.get("callback", {}).get("next_attempt_at") or ""),
+                str(item.get("updated_at") or ""),
+                str(item.get("job_name") or ""),
+            )
+        )
+        if limit > 0:
+            pending = pending[:limit]
+        return pending
+
+    def record_terminal_callback_result(
+        self,
+        job_name: str,
+        *,
+        delivered: bool,
+        event_id: str,
+        error: str | None = None,
+        retry_delay_seconds: float = 0.0,
+    ) -> Dict[str, Any]:
+        with self._state_lock:
+            state = self._hydrate_state_aliases(self._load_state())
+            jobs = state.setdefault("jobs", {})
+            current = dict(jobs.get(job_name, {})) if isinstance(jobs.get(job_name), Mapping) else {}
+            callback = dict(current.get("callback", {})) if isinstance(current.get("callback"), Mapping) else {}
+            if not callback:
+                raise HotLoaderError(f"Job 未注册 callback: {job_name}")
+
+            now = datetime.now(timezone.utc)
+            callback["attempts"] = int(callback.get("attempts") or 0) + 1
+            callback["last_attempt_at"] = now.isoformat()
+            callback["last_event_id"] = event_id
+            callback["last_error"] = error
+            callback["next_attempt_at"] = None
+            if delivered:
+                callback["delivered_at"] = now.isoformat()
+            else:
+                callback["delivered_at"] = None
+                callback["next_attempt_at"] = (now + timedelta(seconds=max(retry_delay_seconds, 0.0))).isoformat()
+
+            current["callback"] = callback
+            jobs[job_name] = current
+            self._save_state(state)
+            return self._sanitize_job_metadata(current)
+
+    def refresh_active_job_statuses(
+        self,
+        *,
+        limit: int = _STATUS_ACTIVE_JOB_REFRESH_LIMIT,
+        include_logs: bool = False,
+    ) -> List[Dict[str, Any]]:
+        state = self._load_state()
+        jobs = state.get("jobs", {})
+        if not isinstance(jobs, Mapping):
+            return []
+
+        active_entries = [
+            (job_name, dict(meta))
+            for job_name, meta in jobs.items()
+            if isinstance(meta, Mapping) and str(meta.get("status") or "") in _ACTIVE_JOB_STATUSES
+        ]
+        unchecked_entries = [
+            item for item in active_entries if not str(item[1].get("status_checked_at") or "").strip()
+        ]
+        checked_entries = [
+            item for item in active_entries if str(item[1].get("status_checked_at") or "").strip()
+        ]
+        unchecked_entries.sort(
+            key=lambda item: (str(item[1].get("updated_at") or ""), item[0]),
+            reverse=True,
+        )
+        checked_entries.sort(
+            key=lambda item: (
+                str(item[1].get("status_checked_at") or ""),
+                str(item[1].get("updated_at") or ""),
+                item[0],
+            )
+        )
+        active_entries = unchecked_entries + checked_entries
+        if limit > 0:
+            active_entries = active_entries[:limit]
+
+        refreshed: List[Dict[str, Any]] = []
+        for job_name, _ in active_entries:
+            try:
+                payload = self.get_job_status(job_name, include_logs=include_logs)
+                payload = self._update_job_state(
+                    job_name,
+                    touch_updated_at=False,
+                    status_checked_at=self._utc_now(),
+                )
+                refreshed.append(payload)
+            except HotLoaderError:
+                continue
+        return refreshed
+
     def get_status(self) -> Dict[str, Any]:
+        self.refresh_active_job_statuses(limit=_STATUS_ACTIVE_JOB_REFRESH_LIMIT, include_logs=False)
         state = self.get_managed_state()
-        ready = self.triton_ready()
-        triton_models = self.list_repository_models(safe=True)
-        gpu_metrics = self.get_triton_gpu_metrics()
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            ready_future = executor.submit(self.triton_ready)
+            triton_models_future = executor.submit(self.list_repository_models, safe=True)
+            gpu_metrics_future = executor.submit(self.get_triton_gpu_metrics)
+            ready = ready_future.result()
+            triton_models = triton_models_future.result()
+            gpu_metrics = gpu_metrics_future.result()
         return {
             "triton": {
                 "url": self.config.triton_url,
@@ -1833,20 +2171,27 @@ class TritonHotLoader:
 
     def unload_alias(self, alias: str) -> Dict[str, Any]:
         self._validate_alias(alias)
-        state = self._hydrate_state_aliases(self._load_state())
-        aliases = state.setdefault("aliases", {})
-        current = aliases.get(alias)
-        if not current:
-            raise HotLoaderError(f"alias 不存在: {alias}")
+        with self._state_lock:
+            state = self._hydrate_state_aliases(self._load_state())
+            aliases = state.setdefault("aliases", {})
+            current = aliases.get(alias)
+            if not current:
+                raise HotLoaderError(f"alias 不存在: {alias}")
+            current = dict(current)
+            models = sorted(set(current.get("models", [])))
 
-        models = sorted(set(current.get("models", [])))
         for model_name in models:
             self._unload_model(model_name, tolerate_missing=True)
             self._delete_model_directory(model_name)
 
-        del aliases[alias]
-        state["updated_at"] = self._utc_now()
-        self._save_state(state)
+        with self._state_lock:
+            state = self._hydrate_state_aliases(self._load_state())
+            aliases = state.setdefault("aliases", {})
+            if alias not in aliases:
+                raise HotLoaderError(f"alias 不存在: {alias}")
+            del aliases[alias]
+            state["updated_at"] = self._utc_now()
+            self._save_state(state)
 
         return {
             "alias": alias,
@@ -1871,207 +2216,38 @@ class TritonHotLoader:
         }
 
     def unload_model_versions(self, version_refs: Iterable[str]) -> Dict[str, Any]:
-        requests: Dict[str, List[str]] = {}
-        for version_ref in sorted(set(version_refs)):
-            model_name, version = self._parse_model_version_ref(version_ref)
-            requests.setdefault(model_name, []).append(version)
-
-        if not requests:
-            raise HotLoaderError("请至少提供一个 model@version")
-
-        state = self._hydrate_state_aliases(self._load_state())
-        aliases = state.setdefault("aliases", {})
-        operation_root = self.config.staging_root / f"version_unload_{uuid.uuid4().hex[:12]}"
-        backup_root = operation_root / "backup"
-
-        removed_entries: List[Dict[str, Any]] = []
-        errors: List[Dict[str, Any]] = []
-        removed_models: List[str] = []
-        reloaded_models: List[str] = []
-        affected_aliases: List[str] = []
-        deleted_aliases: List[str] = []
-        switched_active_versions: List[Dict[str, str]] = []
-
-        try:
-            for model_name, versions_to_remove in sorted(requests.items()):
-                model_dir = self.config.model_repository / model_name
-                if not model_dir.exists():
-                    errors.append(
-                        {
-                            "model": model_name,
-                            "versions": versions_to_remove,
-                            "error": f"模型目录不存在: {model_dir}",
-                        }
-                    )
-                    continue
-
-                try:
-                    existing_versions = self._discover_model_versions(model_dir)
-                except HotLoaderError as exc:
-                    errors.append(
-                        {
-                            "model": model_name,
-                            "versions": versions_to_remove,
-                            "error": str(exc),
-                        }
-                    )
-                    continue
-
-                missing_versions = [
-                    version for version in versions_to_remove if version not in existing_versions
-                ]
-                if missing_versions:
-                    errors.append(
-                        {
-                            "model": model_name,
-                            "versions": versions_to_remove,
-                            "error": f"模型 {model_name} 不存在版本: {', '.join(missing_versions)}",
-                        }
-                    )
-                    continue
-
-                current_active_version = self._resolve_active_version(
-                    state,
-                    model_name,
-                    existing_versions,
-                    model_dir=model_dir,
-                )
-                remaining_versions = [
-                    version for version in existing_versions if version not in versions_to_remove
-                ]
-                backup_dir = backup_root / model_name
-                backup_dir.parent.mkdir(parents=True, exist_ok=True)
-                if backup_dir.exists():
-                    shutil.rmtree(backup_dir, ignore_errors=True)
-                model_dir.rename(backup_dir)
-
-                next_active_version: str | None = None
-                wrote_version_policy = False
-                try:
-                    if remaining_versions:
-                        self._copy_model_directory_excluding_versions(
-                            backup_dir,
-                            model_dir,
-                            versions_to_remove,
-                        )
-                        if (model_dir / "config.pbtxt").exists() and current_active_version in remaining_versions:
-                            next_active_version = current_active_version
-                        else:
-                            next_active_version = self._select_active_version(remaining_versions)
-                        wrote_version_policy = self._write_active_version_policy(
-                            model_dir,
-                            next_active_version,
-                        )
-                        self._load_model(model_name)
-                    else:
-                        self._unload_model(model_name, tolerate_missing=True)
-
-                    touched_aliases, removed_alias_list = self._update_aliases_for_model_version_change(
-                        aliases,
-                        model_name,
-                        remaining_versions,
-                        next_active_version,
-                    )
-                    affected_aliases.extend(touched_aliases)
-                    deleted_aliases.extend(removed_alias_list)
-                    state["updated_at"] = self._utc_now()
-                    self._save_state(state)
-
-                    if remaining_versions:
-                        reloaded_models.append(model_name)
-                        if current_active_version != next_active_version and next_active_version is not None:
-                            switched_active_versions.append(
-                                {
-                                    "model": model_name,
-                                    "from": current_active_version,
-                                    "to": next_active_version,
-                                }
-                            )
-                    else:
-                        removed_models.append(model_name)
-
-                    removed_entries.append(
-                        {
-                            "model": model_name,
-                            "removed_versions": list(versions_to_remove),
-                            "remaining_versions": list(remaining_versions),
-                            "active_version": next_active_version,
-                            "unloaded_model": not remaining_versions,
-                            "wrote_version_policy": wrote_version_policy,
-                        }
-                    )
-                    self._cleanup_backup(backup_dir)
-                except Exception as exc:
-                    self._restore_backup(backup_dir, model_dir)
-                    try:
-                        if model_dir.exists():
-                            if current_active_version in existing_versions:
-                                self._write_active_version_policy(model_dir, current_active_version)
-                            self._load_model(model_name)
-                    except HotLoaderError:
-                        pass
-
-                    error_message = str(exc)
-                    errors.append(
-                        {
-                            "model": model_name,
-                            "versions": versions_to_remove,
-                            "error": error_message,
-                        }
-                    )
-
-            return {
-                "success": not errors,
-                "removed_versions": removed_entries,
-                "removed_models": sorted(set(removed_models)),
-                "reloaded_models": sorted(set(reloaded_models)),
-                "affected_aliases": sorted(set(affected_aliases)),
-                "deleted_aliases": sorted(set(deleted_aliases)),
-                "switched_active_versions": switched_active_versions,
-                "errors": errors,
-                "state": self.get_managed_state(),
-            }
-        finally:
-            if operation_root.exists():
-                shutil.rmtree(operation_root, ignore_errors=True)
+        if any(str(version_ref or "").strip() for version_ref in version_refs):
+            raise HotLoaderError("同名模型已取消版本管理，请按 model_name 或 alias 卸载")
+        raise HotLoaderError("请至少提供一个 model name 或 alias")
 
     def unload_models(self, model_names: Iterable[str]) -> Dict[str, Any]:
         unique_models = sorted({model_name for model_name in model_names if model_name})
         if not unique_models:
             raise HotLoaderError("请至少提供一个 model name")
 
-        state = self._hydrate_state_aliases(self._load_state())
-        aliases = state.setdefault("aliases", {})
         affected_aliases = []
 
         for model_name in unique_models:
             self._unload_model(model_name, tolerate_missing=True)
             self._delete_model_directory(model_name)
 
-        for alias, meta in list(aliases.items()):
-            models = [model_name for model_name in meta.get("models", []) if model_name not in unique_models]
-            if len(models) != len(meta.get("models", [])):
-                affected_aliases.append(alias)
-                if models:
-                    meta["models"] = models
-                    if isinstance(meta.get("model_versions"), dict):
-                        meta["model_versions"] = {
-                            model_name: versions
-                            for model_name, versions in meta["model_versions"].items()
-                            if model_name in models
-                        }
-                    if isinstance(meta.get("active_versions"), dict):
-                        meta["active_versions"] = {
-                            model_name: version
-                            for model_name, version in meta["active_versions"].items()
-                            if model_name in models
-                        }
-                    meta["updated_at"] = self._utc_now()
-                else:
-                    del aliases[alias]
+        with self._state_lock:
+            state = self._hydrate_state_aliases(self._load_state())
+            aliases = state.setdefault("aliases", {})
+            for alias, meta in list(aliases.items()):
+                models = [model_name for model_name in meta.get("models", []) if model_name not in unique_models]
+                if len(models) != len(meta.get("models", [])):
+                    affected_aliases.append(alias)
+                    if models:
+                        meta["models"] = models
+                        meta.pop("model_versions", None)
+                        meta.pop("active_versions", None)
+                        meta["updated_at"] = self._utc_now()
+                    else:
+                        del aliases[alias]
 
-        state["updated_at"] = self._utc_now()
-        self._save_state(state)
+            state["updated_at"] = self._utc_now()
+            self._save_state(state)
 
         return {
             "success": True,

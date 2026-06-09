@@ -64,6 +64,11 @@ python3 cli.py load \
 
 如果不传 `--model-name`，controller 会根据 image tag 自动提取；需要覆盖默认推导时再显式传入。
 
+说明：
+
+- `load` 只负责提交 model-copy Job，本身不会像 HTTP `wait_for_ready=true` 那样阻塞等待终态。
+- 模型文件复制完成后，controller 会自动触发 Triton `load/reload`；可以配合 `job-status` 或 `status` 观察后续状态推进。
+
 ### `load-batch`
 
 批量创建复制 Job：
@@ -86,6 +91,10 @@ python3 cli.py load-batch --file batch.json
   ]
 }
 ```
+
+说明：
+
+- `load-batch` 也是异步提交；返回后需要通过 `job-status`、`status` 或 Web UI 继续观察。
 
 ### `job-status`
 
@@ -113,13 +122,16 @@ python3 cli.py list
 
 ### `unload`
 
-支持三种卸载方式：
+支持两种卸载方式：
 
 ```bash
 python3 cli.py unload --models demo_model
-python3 cli.py unload --versions demo_model@3
-python3 cli.py unload --aliases model_demo_model_abcdef12
+python3 cli.py unload --aliases model_demo_model
 ```
+
+说明：
+
+- 同名模型现在总是直接替换，不再支持 `model_name@version` 级别的版本卸载。
 
 ### `reload`
 
@@ -128,6 +140,12 @@ python3 cli.py unload --aliases model_demo_model_abcdef12
 ```bash
 python3 cli.py reload demo_model another_model
 ```
+
+### 同名模型替换
+
+当新的加载请求解析出与现有模型相同的 `model_name` 时，controller 会直接替换仓库中的同名模型目录，并把状态里的当前镜像更新为最新值；不会再保留同名模型的历史版本记录。
+
+当前实现不会长时间直接覆盖线上目录，而是先复制到挂载卷内的 `.staging/`，再切换到目标目录，避免 Triton 在替换窗口读到半成品模型目录。
 
 ## 运行前提
 
@@ -142,7 +160,10 @@ export HOT_TRITON_STAGING_ROOT=/repository/.staging
 
 - 这样 controller 自己的 `.hot_loader/` 和 `.staging/` 不会落进 Triton model store。
 - model-copy Job 会自动把 PVC 挂到 `MODEL_TARGET_PATH` 的父目录，例如目标是 `/repository/trt_models` 时，Job 实际挂载点是 `/repository`。
+- `--max-concurrent-jobs` 或 `MAX_CONCURRENT_JOBS` 只有在设置为正整数时才会限流；`0` 表示不限制，这也是当前默认值。
 - 如需任务完成后立即自动删除，可设置 `JOB_TTL_SECONDS_AFTER_FINISHED=0`；这也是当前示例部署的默认值。
+- 即使 Job 已被 TTL 删除，只要模型目录已经复制完成，controller 仍会继续自动推进 Triton load/reload。
+- 调试调度、拉镜像或复制问题时，建议临时把 `JOB_TTL_SECONDS_AFTER_FINISHED` 调大到 `300`，这样 Job / Pod / Event 不会立刻消失。
 - Triton 必须启用：
 
 ```bash
