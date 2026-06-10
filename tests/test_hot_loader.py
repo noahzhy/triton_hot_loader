@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -56,6 +57,7 @@ class FakeBatchApi:
     def __init__(self) -> None:
         self.created_jobs = []
         self.job_to_read = None
+        self.read_error = None
         self.list_response = SimpleNamespace(items=[])
 
     def list_namespaced_job(self, **kwargs):
@@ -66,6 +68,8 @@ class FakeBatchApi:
         return SimpleNamespace(metadata=SimpleNamespace(uid="job-uid-1"))
 
     def read_namespaced_job(self, name, namespace):
+        if self.read_error is not None:
+            raise self.read_error
         if self.job_to_read is None:
             raise AssertionError("job_to_read was not configured")
         return self.job_to_read
@@ -222,6 +226,272 @@ class TritonHotLoaderKubernetesJobTests(unittest.TestCase):
     def test_create_model_copy_job_rejects_unapproved_registry(self) -> None:
         with self.assertRaisesRegex(HotLoaderError, "registry 前缀"):
             self.loader.create_model_copy_job("demo_model", "registry.example.com/demo:1")
+
+    def test_register_loaded_model_skips_local_repository_check_when_repository_is_job_only(self) -> None:
+        remote_config = self.config.with_updates(
+            model_repository=Path(self.temp_dir.name) / "controller-runtime" / "repository",
+            repository_maintenance_image="ccr.ccs.tencentyun.com/clobotics/triton-hot-loader:helper",
+        )
+        self.loader = TritonHotLoader(remote_config)
+
+        registration = self.loader._register_loaded_model(
+            "demo_model",
+            "ccr.ccs.tencentyun.com/clobotics/demo:old",
+        )
+
+        self.assertEqual(registration["alias"], "model_demo_model")
+        self.assertIn("demo_model", self.loader.get_managed_state()["managed_models"])
+
+    def test_get_job_status_finalizes_ttl_cleaned_job_when_repository_is_job_only(self) -> None:
+        remote_config = self.config.with_updates(
+            model_repository=Path(self.temp_dir.name) / "controller-runtime" / "repository",
+        )
+        self.loader = TritonHotLoader(remote_config)
+        self.batch_api = FakeBatchApi()
+        self.batch_api.read_error = RuntimeError("job already deleted")
+        self.loader._get_batch_v1_api = lambda: self.batch_api  # type: ignore[method-assign]
+        self.loader._get_core_v1_api = lambda: self.core_api  # type: ignore[method-assign]
+        self.loader._load_model = lambda model_name: None  # type: ignore[method-assign]
+        self.loader._model_ready_in_triton = lambda model_name: True  # type: ignore[method-assign]
+        self.loader._update_job_state(
+            "demo-job",
+            status="COPY_RUNNING",
+            model_name="demo_model",
+            image="ccr.ccs.tencentyun.com/clobotics/demo:new",
+        )
+
+        payload = self.loader.get_job_status("demo-job")
+
+        self.assertEqual(payload["status"], "MODEL_READY")
+        self.assertEqual(payload["model_name"], "demo_model")
+
+    def test_get_job_status_finalizes_ttl_cleaned_job_when_repository_uses_sync_mode(self) -> None:
+        base_dir = Path(self.temp_dir.name)
+        local_repository = base_dir / "shared-volume" / "trt_models"
+        source_repository = base_dir / "repository" / "trt_models"
+        sync_config = self.config.with_updates(
+            model_repository=local_repository,
+            state_file=base_dir / "shared-volume" / "state.json",
+            staging_root=base_dir / "shared-volume" / ".staging",
+            model_target_path=str(source_repository),
+        )
+        self.loader = TritonHotLoader(sync_config)
+        self.batch_api = FakeBatchApi()
+        self.batch_api.read_error = RuntimeError("job already deleted")
+        self.loader._get_batch_v1_api = lambda: self.batch_api  # type: ignore[method-assign]
+        self.loader._get_core_v1_api = lambda: self.core_api  # type: ignore[method-assign]
+        self.loader._load_model = lambda model_name: None  # type: ignore[method-assign]
+        self.loader._model_ready_in_triton = lambda model_name: True  # type: ignore[method-assign]
+        write_model_bundle(source_repository, "demo_model", ["1"])
+        self.loader._update_job_state(
+            "demo-job",
+            status="COPY_RUNNING",
+            model_name="demo_model",
+            image="ccr.ccs.tencentyun.com/clobotics/demo:new",
+        )
+
+        payload = self.loader.get_job_status("demo-job")
+
+        self.assertEqual(payload["status"], "MODEL_READY")
+        self.assertTrue((local_repository / "demo_model" / "1" / "model.onnx").exists())
+
+    def test_get_job_status_preserves_terminal_detail_after_ttl_cleanup(self) -> None:
+        self.batch_api.read_error = RuntimeError("job already deleted")
+        self.loader._get_batch_v1_api = lambda: self.batch_api  # type: ignore[method-assign]
+        self.loader._update_job_state(
+            "demo-job",
+            status="MODEL_READY",
+            model_name="demo_model",
+            image="ccr.ccs.tencentyun.com/clobotics/demo:new",
+            detail="Triton 模型已完成 load/reload",
+            triton_ready=True,
+        )
+
+        payload = self.loader.get_job_status("demo-job")
+
+        self.assertEqual(payload["status"], "MODEL_READY")
+        self.assertEqual(payload["detail"], "Triton 模型已完成 load/reload")
+
+    def test_finalize_successful_job_syncs_model_into_local_temporary_repository(self) -> None:
+        base_dir = Path(self.temp_dir.name)
+        local_repository = base_dir / "shared-volume" / "trt_models"
+        source_repository = base_dir / "repository" / "trt_models"
+        sync_config = self.config.with_updates(
+            model_repository=local_repository,
+            state_file=base_dir / "shared-volume" / "state.json",
+            staging_root=base_dir / "shared-volume" / ".staging",
+            model_target_path=str(source_repository),
+        )
+        self.loader = TritonHotLoader(sync_config)
+        self.loader._get_batch_v1_api = lambda: self.batch_api  # type: ignore[method-assign]
+        self.loader._get_core_v1_api = lambda: self.core_api  # type: ignore[method-assign]
+        self.loader._load_model = lambda model_name: None  # type: ignore[method-assign]
+        self.loader._model_ready_in_triton = lambda model_name: True  # type: ignore[method-assign]
+        write_model_bundle(source_repository, "demo_model", ["1"])
+
+        payload = self.loader._finalize_successful_job(
+            "demo-job",
+            "demo_model",
+            "ccr.ccs.tencentyun.com/clobotics/demo:new",
+        )
+
+        self.assertEqual(payload["status"], "MODEL_READY")
+        self.assertTrue((local_repository / "demo_model" / "config.pbtxt").exists())
+        self.assertTrue((local_repository / "demo_model" / "1" / "model.onnx").exists())
+        self.assertIn("demo_model", self.loader.get_managed_state()["managed_models"])
+
+    def test_finalize_successful_job_serializes_same_model_finalization(self) -> None:
+        base_dir = Path(self.temp_dir.name)
+        local_repository = base_dir / "shared-volume" / "trt_models"
+        source_repository = base_dir / "repository" / "trt_models"
+        sync_config = self.config.with_updates(
+            model_repository=local_repository,
+            state_file=base_dir / "shared-volume" / "state.json",
+            staging_root=base_dir / "shared-volume" / ".staging",
+            model_target_path=str(source_repository),
+        )
+        self.loader = TritonHotLoader(sync_config)
+        self.loader._get_batch_v1_api = lambda: self.batch_api  # type: ignore[method-assign]
+        self.loader._get_core_v1_api = lambda: self.core_api  # type: ignore[method-assign]
+        self.loader._model_ready_in_triton = lambda model_name: True  # type: ignore[method-assign]
+        write_model_bundle(source_repository, "demo_model", ["1"])
+
+        load_calls = []
+        first_load_started = threading.Event()
+        release_first_load = threading.Event()
+
+        def fake_load_model(model_name: str) -> None:
+            load_calls.append(model_name)
+            first_load_started.set()
+            release_first_load.wait(timeout=2)
+
+        self.loader._load_model = fake_load_model  # type: ignore[method-assign]
+
+        results = []
+        errors = []
+
+        def run_finalize() -> None:
+            try:
+                results.append(
+                    self.loader._finalize_successful_job(
+                        "demo-job",
+                        "demo_model",
+                        "ccr.ccs.tencentyun.com/clobotics/demo:new",
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        first_thread = threading.Thread(target=run_finalize)
+        second_thread = threading.Thread(target=run_finalize)
+
+        first_thread.start()
+        self.assertTrue(first_load_started.wait(timeout=2))
+        second_thread.start()
+        release_first_load.set()
+        first_thread.join(timeout=2)
+        second_thread.join(timeout=2)
+
+        self.assertFalse(errors)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(load_calls, ["demo_model"])
+        self.assertTrue(all(result["status"] == "MODEL_READY" for result in results))
+
+    def test_unload_models_deletes_local_and_source_repository_when_controller_can_access_both(self) -> None:
+        base_dir = Path(self.temp_dir.name)
+        local_repository = base_dir / "shared-volume" / "trt_models"
+        source_repository = base_dir / "repository" / "trt_models"
+        sync_config = self.config.with_updates(
+            model_repository=local_repository,
+            state_file=base_dir / "shared-volume" / "state.json",
+            staging_root=base_dir / "shared-volume" / ".staging",
+            model_target_path=str(source_repository),
+        )
+        self.loader = TritonHotLoader(sync_config)
+        self.batch_api = FakeBatchApi()
+        self.loader._get_batch_v1_api = lambda: self.batch_api  # type: ignore[method-assign]
+        self.loader._get_core_v1_api = lambda: self.core_api  # type: ignore[method-assign]
+        self.loader._unload_model = lambda model_name, tolerate_missing=True: None  # type: ignore[method-assign]
+        self.loader.list_repository_models = lambda safe=False: []  # type: ignore[method-assign]
+        write_model_bundle(source_repository, "demo_model", ["1"])
+        write_model_bundle(local_repository, "demo_model", ["1"])
+        self.loader._register_loaded_model("demo_model", "ccr.ccs.tencentyun.com/clobotics/demo:old")
+
+        result = self.loader.unload_models(["demo_model"])
+
+        self.assertTrue(result["success"])
+        self.assertFalse((local_repository / "demo_model").exists())
+        self.assertFalse((source_repository / "demo_model").exists())
+        self.assertEqual(self.batch_api.created_jobs, [])
+
+    def test_unload_models_uses_repository_cleanup_job_when_repository_is_job_only(self) -> None:
+        remote_config = self.config.with_updates(
+            model_repository=Path(self.temp_dir.name) / "controller-runtime" / "repository",
+            repository_maintenance_image="ccr.ccs.tencentyun.com/clobotics/triton-hot-loader:helper",
+        )
+        self.loader = TritonHotLoader(remote_config)
+        self.batch_api = FakeBatchApi()
+        self.batch_api.job_to_read = SimpleNamespace(status=SimpleNamespace(succeeded=1, failed=0))
+        self.loader._get_batch_v1_api = lambda: self.batch_api  # type: ignore[method-assign]
+        self.loader._get_core_v1_api = lambda: self.core_api  # type: ignore[method-assign]
+        self.loader._unload_model = lambda model_name, tolerate_missing=True: None  # type: ignore[method-assign]
+        self.loader.list_repository_models = lambda safe=False: []  # type: ignore[method-assign]
+        self.loader._register_loaded_model("demo_model", "ccr.ccs.tencentyun.com/clobotics/demo:old")
+
+        result = self.loader.unload_models(["demo_model"])
+
+        self.assertTrue(result["success"])
+        namespace, manifest = self.batch_api.created_jobs[0]
+        self.assertEqual(namespace, "default")
+        container = manifest["spec"]["template"]["spec"]["containers"][0]
+        self.assertEqual(container["image"], "ccr.ccs.tencentyun.com/clobotics/triton-hot-loader:helper")
+        self.assertEqual(container["env"][1]["value"], "/repository/trt_models")
+        self.assertIn('rm -rf "${TARGET_DIR}"', container["args"][0])
+        self.assertEqual(container["volumeMounts"][0]["mountPath"], "/repository")
+        self.assertEqual(
+            manifest["spec"]["template"]["spec"]["volumes"][0]["persistentVolumeClaim"]["claimName"],
+            "triton-repository-pvc",
+        )
+        self.assertEqual(result["removed_models"], ["demo_model"])
+
+    def test_unload_models_waits_for_triton_to_leave_ready_before_deleting_repository(self) -> None:
+        call_order = []
+        repository_states = iter(
+            [
+                [{"name": "demo_model", "version": "1", "state": "READY", "reason": ""}],
+                [{"name": "demo_model", "version": "1", "state": "UNAVAILABLE", "reason": ""}],
+            ]
+        )
+
+        self.loader._unload_model = lambda model_name, tolerate_missing=True: call_order.append(("unload", model_name))  # type: ignore[method-assign]
+        self.loader._delete_model_directory = lambda model_name: call_order.append(("delete", model_name))  # type: ignore[method-assign]
+        self.loader.list_repository_models = lambda safe=False: next(repository_states)  # type: ignore[method-assign]
+
+        result = self.loader.unload_models(["demo_model"])
+
+        self.assertTrue(result["success"])
+        self.assertEqual(call_order, [("unload", "demo_model"), ("delete", "demo_model")])
+
+    def test_unload_alias_waits_for_triton_to_leave_ready_before_deleting_repository(self) -> None:
+        write_model_bundle(self.config.model_repository, "demo_model", ["1"])
+        self.loader._register_loaded_model("demo_model", "ccr.ccs.tencentyun.com/clobotics/demo:old")
+
+        call_order = []
+        repository_states = iter(
+            [
+                [{"name": "demo_model", "version": "1", "state": "READY", "reason": ""}],
+                [{"name": "demo_model", "version": "1", "state": "UNAVAILABLE", "reason": ""}],
+            ]
+        )
+
+        self.loader._unload_model = lambda model_name, tolerate_missing=True: call_order.append(("unload", model_name))  # type: ignore[method-assign]
+        self.loader._delete_model_directory = lambda model_name: call_order.append(("delete", model_name))  # type: ignore[method-assign]
+        self.loader.list_repository_models = lambda safe=False: next(repository_states)  # type: ignore[method-assign]
+
+        result = self.loader.unload_alias("model_demo_model")
+
+        self.assertEqual(result["models"], ["demo_model"])
+        self.assertEqual(call_order, [("unload", "demo_model"), ("delete", "demo_model")])
 
     def test_assert_job_capacity_skips_limit_when_disabled(self) -> None:
         self.loader.config = self.loader.config.with_updates(max_concurrent_jobs=0)

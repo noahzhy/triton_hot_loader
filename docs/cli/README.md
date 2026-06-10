@@ -151,6 +151,7 @@ python3 cli.py reload demo_model another_model
 
 - Controller 容器或本地环境必须能访问 Kubernetes API。
 - `MODEL_TARGET_PATH` 对应的路径应与 Triton Repository PVC 保持一致。
+- 如果 Triton 的在线模型仓库必须放在临时目录，请把 `HOT_TRITON_MODEL_REPOSITORY` 显式设为临时目录路径，并确保它与 `MODEL_TARGET_PATH` 不同；这样 controller 会自动进入 repository sync 模式。
 - 如果 `MODEL_TARGET_PATH` 指向类似 `/repository/trt_models` 的子目录，建议同时设置：
 
 ```bash
@@ -160,6 +161,19 @@ export HOT_TRITON_STAGING_ROOT=/repository/.staging
 
 - 这样 controller 自己的 `.hot_loader/` 和 `.staging/` 不会落进 Triton model store。
 - model-copy Job 会自动把 PVC 挂到 `MODEL_TARGET_PATH` 的父目录，例如目标是 `/repository/trt_models` 时，Job 实际挂载点是 `/repository`。
+- Triton 临时目录 + PVC 同步模式下建议同时设置：
+
+```bash
+export HOT_TRITON_MODEL_REPOSITORY=/shared-volume/trt_models
+export HOT_TRITON_STATE_FILE=/shared-volume/.hot_loader/state.json
+export HOT_TRITON_STAGING_ROOT=/shared-volume/.staging
+export MODEL_TARGET_PATH=/repository/trt_models
+export TRITON_REPOSITORY_PVC=triton-repository-pvc
+export REPOSITORY_MAINTENANCE_IMAGE=ccr.ccs.tencentyun.com/clobotics/triton-hot-loader:latest
+```
+
+- 这种模式下 controller 需要同时挂载临时目录和 `/repository` 对应的 PVC 路径；Triton 只需要挂载临时目录。
+- 其中 `REPOSITORY_MAINTENANCE_IMAGE` 只在 controller 看不到 PVC 挂载点时，才会退回到 cleanup Job 使用。
 - `--max-concurrent-jobs` 或 `MAX_CONCURRENT_JOBS` 只有在设置为正整数时才会限流；`0` 表示不限制，这也是当前默认值。
 - 如需任务完成后立即自动删除，可设置 `JOB_TTL_SECONDS_AFTER_FINISHED=0`；这也是当前示例部署的默认值。
 - 即使 Job 已被 TTL 删除，只要模型目录已经复制完成，controller 仍会继续自动推进 Triton load/reload。
@@ -168,7 +182,7 @@ export HOT_TRITON_STAGING_ROOT=/repository/.staging
 
 ```bash
 tritonserver \
-  --model-repository=/repository/trt_models \
+  --model-repository=/shared-volume/trt_models \
   --model-control-mode=EXPLICIT \
   --repository-poll-secs=0
 ```

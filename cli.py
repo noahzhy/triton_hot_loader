@@ -105,6 +105,11 @@ def add_common_runtime_args(parser: argparse.ArgumentParser) -> None:
         help=f"允许同时运行的 Job 上限，默认: {defaults.max_concurrent_jobs}（0 表示不限制）",
     )
     parser.add_argument(
+        "--repository-maintenance-image",
+        default=defaults.repository_maintenance_image,
+        help="Job-only repository 模式下用于清理 PVC 模型目录的辅助镜像",
+    )
+    parser.add_argument(
         "--request-timeout",
         type=float,
         default=defaults.request_timeout,
@@ -182,6 +187,7 @@ def build_config_from_args(args: argparse.Namespace) -> HotLoaderConfig:
         model_copy_cpu_limit=args.model_copy_cpu_limit,
         model_copy_memory_limit=args.model_copy_memory_limit,
         max_concurrent_jobs=args.max_concurrent_jobs,
+        repository_maintenance_image=args.repository_maintenance_image,
         request_timeout=args.request_timeout,
     )
 

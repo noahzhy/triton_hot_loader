@@ -56,12 +56,15 @@ _MODEL_COPY_MEMORY_LIMIT_ENV_NAMES = ("MODEL_COPY_MEMORY_LIMIT",)
 _MAX_CONCURRENT_JOBS_ENV_NAMES = ("MAX_CONCURRENT_JOBS",)
 _JOB_IMAGE_PULL_POLICY_ENV_NAMES = ("MODEL_COPY_IMAGE_PULL_POLICY",)
 _JOB_TOLERATIONS_ENV_NAMES = ("JOB_TOLERATIONS_JSON",)
+_REPOSITORY_MAINTENANCE_IMAGE_ENV_NAMES = ("REPOSITORY_MAINTENANCE_IMAGE",)
 _CONTROLLER_LABEL = "triton-hot-loader"
 _MODEL_NAME_REQUEST_PATTERN = re.compile(r"^[a-z0-9_-]+$")
 _IMAGE_REF_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@:-]*$")
 _K8S_NAME_SANITIZE_PATTERN = re.compile(r"[^a-z0-9-]+")
 _IMAGE_TAG_RELEASE_SUFFIX_PATTERN = re.compile(r"(?:[-_])\d{8}(?:[-_]\d{6})?$")
 _MODEL_NAME_DERIVE_SANITIZE_PATTERN = re.compile(r"[^a-z0-9_]+")
+_REPOSITORY_JOB_TERMINAL_POLL_INTERVAL_SECONDS = 2.0
+_REPOSITORY_JOB_TIMEOUT_SECONDS = 300.0
 
 _EXPLICIT_CONTROL_HINT = (
     "当前 Triton 不允许通过 API 显式执行 load/unload。\n"
@@ -78,6 +81,10 @@ _SYNC_LOAD_FAILURE_STATUSES = {"COPY_FAILED", "TRITON_RELOAD_FAILED"}
 _SYNC_LOAD_TERMINAL_STATUSES = _SYNC_LOAD_SUCCESS_STATUSES | _SYNC_LOAD_FAILURE_STATUSES
 _SYNC_LOAD_DEFAULT_TIMEOUT_SECONDS = 600.0
 _SYNC_LOAD_DEFAULT_POLL_INTERVAL_SECONDS = 2.0
+_SYNC_UNLOAD_DEFAULT_TIMEOUT_SECONDS = 120.0
+_SYNC_UNLOAD_DEFAULT_POLL_INTERVAL_SECONDS = 1.0
+_REPOSITORY_SYNC_VISIBILITY_TIMEOUT_SECONDS = 15.0
+_REPOSITORY_SYNC_VISIBILITY_POLL_INTERVAL_SECONDS = 0.5
 _ACTIVE_JOB_STATUSES = {
     "JOB_CREATED",
     "SCHEDULING",
@@ -90,6 +97,8 @@ _STATUS_ACTIVE_JOB_REFRESH_LIMIT = 6
 
 _STATE_LOCKS_GUARD = threading.Lock()
 _STATE_LOCKS: Dict[str, threading.RLock] = {}
+_MODEL_OPERATION_LOCKS_GUARD = threading.Lock()
+_MODEL_OPERATION_LOCKS: Dict[str, threading.RLock] = {}
 
 
 def _state_lock_for(state_file: Path) -> threading.RLock:
@@ -99,6 +108,16 @@ def _state_lock_for(state_file: Path) -> threading.RLock:
         if lock is None:
             lock = threading.RLock()
             _STATE_LOCKS[state_key] = lock
+    return lock
+
+
+def _model_operation_lock_for(state_file: Path, model_name: str) -> threading.RLock:
+    lock_key = f"{state_file.expanduser().resolve(strict=False)}::{model_name}"
+    with _MODEL_OPERATION_LOCKS_GUARD:
+        lock = _MODEL_OPERATION_LOCKS.get(lock_key)
+        if lock is None:
+            lock = threading.RLock()
+            _MODEL_OPERATION_LOCKS[lock_key] = lock
         return lock
 
 
@@ -335,6 +354,7 @@ class HotLoaderConfig:
     max_concurrent_jobs: int = 0
     job_image_pull_policy: str = "IfNotPresent"
     job_tolerations: List[Dict[str, Any]] = field(default_factory=list)
+    repository_maintenance_image: str | None = None
     request_timeout: float = 60.0
 
     def __post_init__(self) -> None:
@@ -344,6 +364,9 @@ class HotLoaderConfig:
         self.model_repository = Path(self.model_repository).expanduser().resolve()
         self.state_file = Path(self.state_file).expanduser().resolve()
         self.staging_root = Path(self.staging_root).expanduser().resolve()
+        self.repository_maintenance_image = (
+            self.repository_maintenance_image.strip() if self.repository_maintenance_image else None
+        ) or None
         self.job_tolerations = _normalize_job_tolerations(
             self.job_tolerations,
             source_name="job_tolerations",
@@ -378,6 +401,7 @@ class HotLoaderConfig:
                 _env_default(*_JOB_TOLERATIONS_ENV_NAMES),
                 source_name=_JOB_TOLERATIONS_ENV_NAMES[0],
             ),
+            repository_maintenance_image=_env_default(*_REPOSITORY_MAINTENANCE_IMAGE_ENV_NAMES),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -401,6 +425,7 @@ class HotLoaderConfig:
             "max_concurrent_jobs": self.max_concurrent_jobs,
             "job_image_pull_policy": self.job_image_pull_policy,
             "job_tolerations": self.job_tolerations,
+            "repository_maintenance_image": self.repository_maintenance_image,
             "request_timeout": self.request_timeout,
         }
 
@@ -426,6 +451,43 @@ class TritonHotLoader:
         self.config.state_file.parent.mkdir(parents=True, exist_ok=True)
         if not self.config.state_file.exists():
             self._save_state(self._empty_state())
+
+    def _controller_can_manage_repository_locally(self) -> bool:
+        target = self.config.model_target_path.strip()
+        if not target:
+            return False
+
+        normalized_target = str(PurePosixPath(target)).rstrip("/") or "/"
+        if target.startswith("/") and not normalized_target.startswith("/"):
+            normalized_target = f"/{normalized_target.lstrip('/')}"
+
+        local_repository = self.config.model_repository.as_posix().rstrip("/") or "/"
+        return local_repository == normalized_target
+
+    def _uses_job_only_repository(self) -> bool:
+        return not self._controller_can_manage_repository_locally()
+
+    def _job_repository_path(self) -> Path:
+        return Path(self.config.model_target_path).expanduser()
+
+    def _job_repository_mount_path(self) -> Path:
+        return Path(_derive_job_volume_mount_path(self.config.model_target_path)).expanduser()
+
+    def _controller_can_access_job_repository_locally(self) -> bool:
+        try:
+            mount_path = self._job_repository_mount_path()
+        except HotLoaderError:
+            return False
+        return mount_path.exists() and mount_path.is_dir()
+
+    def _model_operation_lock(self, model_name: str) -> threading.RLock:
+        return _model_operation_lock_for(self.config.state_file, model_name)
+
+    def _uses_repository_sync_mode(self) -> bool:
+        return self._uses_job_only_repository() and self._controller_can_access_job_repository_locally()
+
+    def _can_verify_local_model_repository(self) -> bool:
+        return not self._uses_job_only_repository() or self._uses_repository_sync_mode()
 
     @staticmethod
     def _empty_state() -> Dict[str, Any]:
@@ -1124,6 +1186,238 @@ class TritonHotLoader:
             },
         }
 
+    def _build_repository_cleanup_job_manifest(self, job_name: str, model_name: str) -> Dict[str, Any]:
+        if not self.config.repository_maintenance_image:
+            raise HotLoaderError(
+                "当前部署使用 Job-only repository 模式；请配置 REPOSITORY_MAINTENANCE_IMAGE 以便卸载时清理 PVC 中的模型目录"
+            )
+
+        model_label = self._normalize_k8s_name(model_name, limit=63) or "unknown-model"
+        job_volume_mount_path = _derive_job_volume_mount_path(self.config.model_target_path)
+        cleanup_script = "\n".join(
+            [
+                "set -eu",
+                'TARGET_DIR="${MODEL_TARGET_PATH%/}/${MODEL_NAME}"',
+                'echo "cleanup target: ${TARGET_DIR}"',
+                'rm -rf "${TARGET_DIR}"',
+                'echo "repository cleanup done"',
+            ]
+        )
+
+        return {
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": {
+                "name": job_name,
+                "namespace": self.config.k8s_namespace,
+                "labels": {
+                    "app": _CONTROLLER_LABEL,
+                    "job-role": "repository-cleanup",
+                    "model-name": model_label,
+                },
+                "annotations": {
+                    "hot-loader/model-name": model_name,
+                },
+            },
+            "spec": {
+                "backoffLimit": self.config.job_backoff_limit,
+                "ttlSecondsAfterFinished": max(self.config.job_ttl_seconds_after_finished, 60),
+                "template": {
+                    "metadata": {
+                        "labels": {
+                            "app": _CONTROLLER_LABEL,
+                            "job-role": "repository-cleanup",
+                            "model-name": model_label,
+                        }
+                    },
+                    "spec": {
+                        "restartPolicy": "Never",
+                        "tolerations": self.config.job_tolerations,
+                        "containers": [
+                            {
+                                "name": "repository-cleanup",
+                                "image": self.config.repository_maintenance_image,
+                                "imagePullPolicy": self.config.job_image_pull_policy,
+                                "env": [
+                                    {"name": "MODEL_NAME", "value": model_name},
+                                    {"name": "MODEL_TARGET_PATH", "value": self.config.model_target_path},
+                                ],
+                                "command": ["/bin/sh", "-c"],
+                                "args": [cleanup_script],
+                                "volumeMounts": [
+                                    {
+                                        "name": "triton-repository",
+                                        "mountPath": job_volume_mount_path,
+                                    }
+                                ],
+                                "resources": {
+                                    "requests": {
+                                        "cpu": self.config.model_copy_cpu_request,
+                                        "memory": self.config.model_copy_memory_request,
+                                    },
+                                    "limits": {
+                                        "cpu": self.config.model_copy_cpu_limit,
+                                        "memory": self.config.model_copy_memory_limit,
+                                    },
+                                },
+                            }
+                        ],
+                        "volumes": [
+                            {
+                                "name": "triton-repository",
+                                "persistentVolumeClaim": {
+                                    "claimName": self.config.triton_repository_pvc,
+                                },
+                            }
+                        ],
+                    },
+                },
+            },
+        }
+
+    def _wait_for_repository_job_completion(
+        self,
+        job_name: str,
+        *,
+        timeout_seconds: float = _REPOSITORY_JOB_TIMEOUT_SECONDS,
+        poll_interval_seconds: float = _REPOSITORY_JOB_TERMINAL_POLL_INTERVAL_SECONDS,
+    ) -> None:
+        batch_api = self._get_batch_v1_api()
+        deadline = time.monotonic() + timeout_seconds
+
+        while True:
+            try:
+                job = batch_api.read_namespaced_job(
+                    name=job_name,
+                    namespace=self.config.k8s_namespace,
+                )
+            except Exception as exc:
+                raise HotLoaderError(f"查询 repository cleanup Job 失败: {self._exception_text(exc)}") from exc
+
+            job_status = getattr(job, "status", None)
+            if (getattr(job_status, "succeeded", 0) or 0) > 0:
+                return
+            if (getattr(job_status, "failed", 0) or 0) > 0:
+                pods = self._list_job_pods(job_name)
+                pod_name = getattr(getattr(pods[0], "metadata", None), "name", None) if pods else None
+                logs = self._read_pod_logs(pod_name)
+                detail = logs or "repository cleanup Job 执行失败"
+                raise HotLoaderError(detail)
+
+            if time.monotonic() >= deadline:
+                raise HotLoaderError(
+                    f"等待 repository cleanup Job 超时 ({int(timeout_seconds)}s): {job_name}"
+                )
+
+            time.sleep(max(poll_interval_seconds, 0))
+
+    def _delete_model_directory_via_job(self, model_name: str) -> None:
+        job_suffix = uuid.uuid4().hex[:8]
+        model_label = self._normalize_k8s_name(model_name, limit=40) or "unknown-model"
+        job_name = f"{model_label}-cleanup-{job_suffix}"
+        manifest = self._build_repository_cleanup_job_manifest(job_name, model_name)
+        batch_api = self._get_batch_v1_api()
+
+        try:
+            batch_api.create_namespaced_job(
+                namespace=self.config.k8s_namespace,
+                body=manifest,
+            )
+        except Exception as exc:
+            raise HotLoaderError(f"创建 repository cleanup Job 失败: {self._exception_text(exc)}") from exc
+
+        self._wait_for_repository_job_completion(job_name)
+
+    @staticmethod
+    def _model_bundle_ready(model_dir: Path) -> bool:
+        if not model_dir.exists() or not model_dir.is_dir():
+            return False
+
+        visible_entries = [path for path in model_dir.iterdir() if not path.name.startswith(".")]
+        if not visible_entries:
+            return False
+
+        version_dirs = [
+            path
+            for path in visible_entries
+            if path.is_dir() and _TRITON_VERSION_DIR_PATTERN.match(path.name)
+        ]
+        if not version_dirs:
+            return any(path.is_file() for path in visible_entries)
+
+        for version_dir in version_dirs:
+            if not any(not child.name.startswith(".") for child in version_dir.iterdir()):
+                return False
+        return True
+
+    def _wait_for_model_bundle_ready(
+        self,
+        model_dir: Path,
+        *,
+        timeout_seconds: float = _REPOSITORY_SYNC_VISIBILITY_TIMEOUT_SECONDS,
+        poll_interval_seconds: float = _REPOSITORY_SYNC_VISIBILITY_POLL_INTERVAL_SECONDS,
+        missing_hint: str = "请检查 Job 是否把文件复制到了 PVC",
+    ) -> None:
+        deadline = time.monotonic() + timeout_seconds
+
+        while True:
+            if self._model_bundle_ready(model_dir):
+                return
+            if time.monotonic() >= deadline:
+                if model_dir.exists():
+                    raise HotLoaderError(
+                        f"模型目录尚未准备完成: {model_dir}，{missing_hint}"
+                    )
+                raise HotLoaderError(
+                    f"模型目录不存在: {model_dir}，{missing_hint}"
+                )
+            time.sleep(max(poll_interval_seconds, 0))
+
+    def _sync_model_from_job_repository(self, model_name: str) -> None:
+        source_dir = self._job_repository_path() / model_name
+        self._wait_for_model_bundle_ready(source_dir)
+
+        target_dir = self.config.model_repository / model_name
+        target_dir.parent.mkdir(parents=True, exist_ok=True)
+
+        sync_root = self.config.staging_root / model_name
+        sync_root.mkdir(parents=True, exist_ok=True)
+        sync_token = uuid.uuid4().hex
+        staging_dir = sync_root / f"sync-{sync_token}"
+        backup_dir = sync_root / f"sync-{sync_token}.backup"
+
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        shutil.rmtree(backup_dir, ignore_errors=True)
+
+        try:
+            shutil.copytree(source_dir, staging_dir)
+            if target_dir.exists():
+                shutil.move(str(target_dir), str(backup_dir))
+            if target_dir.exists():
+                shutil.rmtree(target_dir, ignore_errors=True)
+            shutil.move(str(staging_dir), str(target_dir))
+            self._wait_for_model_bundle_ready(
+                target_dir,
+                missing_hint="请检查控制器临时目录是否可写",
+            )
+        except Exception as exc:
+            if target_dir.exists():
+                shutil.rmtree(target_dir, ignore_errors=True)
+            if backup_dir.exists() and not target_dir.exists():
+                shutil.move(str(backup_dir), str(target_dir))
+            raise HotLoaderError(
+                f"从 Job repository 同步模型到本地临时目录失败: {source_dir} -> {target_dir} ({exc})"
+            ) from exc
+        else:
+            shutil.rmtree(backup_dir, ignore_errors=True)
+        finally:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+
+    def _delete_model_directory_from_job_repository(self, model_name: str) -> None:
+        target_dir = self._job_repository_path() / model_name
+        if target_dir.exists():
+            shutil.rmtree(target_dir, ignore_errors=True)
+
     def _update_job_state(self, job_name: str, *, touch_updated_at: bool = True, **updates: Any) -> Dict[str, Any]:
         with self._state_lock:
             state = self._hydrate_state_aliases(self._load_state())
@@ -1158,7 +1452,7 @@ class TritonHotLoader:
                 del aliases[alias]
 
     def _register_loaded_model(self, model_name: str, image_ref: str) -> Dict[str, Any]:
-        if not (self.config.model_repository / model_name).exists():
+        if self._can_verify_local_model_repository() and not (self.config.model_repository / model_name).exists():
             raise HotLoaderError(
                 f"模型目录不存在: {self.config.model_repository / model_name}，请检查 Job 是否把文件复制到了 PVC"
             )
@@ -1345,93 +1639,128 @@ class TritonHotLoader:
             return state_text == "READY"
         return False
 
-    def _finalize_successful_job(self, job_name: str, model_name: str, image_ref: str) -> Dict[str, Any]:
-        cached_state = self._load_state().get("jobs", {}).get(job_name, {})
-        if isinstance(cached_state, Mapping):
-            final_status = cached_state.get("status")
-            if final_status in {"MODEL_READY", "TRITON_RELOAD_FAILED"}:
-                return dict(cached_state)
-            if final_status == "TRITON_RELOAD_RUNNING":
-                if self._model_ready_in_triton(model_name):
-                    return self._update_job_state(
-                        job_name,
-                        status="MODEL_READY",
-                        model_name=model_name,
-                        image=image_ref,
-                        detail="Triton 模型已完成 load/reload",
-                        triton_ready=True,
-                        error=None,
-                    )
-                reload_attempts = int(cached_state.get("triton_reload_attempts") or 0) + 1
-                reload_attempted_at = self._utc_now()
-                try:
-                    self._load_model(model_name)
-                    ready = self._model_ready_in_triton(model_name)
-                except Exception as exc:
-                    return self._update_job_state(
-                        job_name,
-                        status="TRITON_RELOAD_RUNNING",
-                        model_name=model_name,
-                        image=image_ref,
-                        detail=f"Triton 自动 reload 失败，将继续重试: {exc}",
-                        triton_ready=False,
-                        triton_reload_attempts=reload_attempts,
-                        triton_reload_last_attempt_at=reload_attempted_at,
-                        error=str(exc),
-                    )
-                return self._update_job_state(
-                    job_name,
-                    status="MODEL_READY" if ready else "TRITON_RELOAD_RUNNING",
-                    model_name=model_name,
-                    image=image_ref,
-                    detail=(
-                        "Triton 模型已完成 load/reload"
-                        if ready
-                        else f"已自动触发 Triton reload 第 {reload_attempts} 次，正在等待模型变为 READY"
-                    ),
-                    triton_ready=ready,
-                    triton_reload_attempts=reload_attempts,
-                    triton_reload_last_attempt_at=reload_attempted_at,
-                    error=None,
+    def _model_unloaded_in_triton(self, model_name: str) -> bool:
+        matched = False
+        for item in self.list_repository_models():
+            if item.get("name") != model_name:
+                continue
+            matched = True
+            state_text = str(item.get("state") or "").upper()
+            if state_text == "READY":
+                return False
+        return True if matched else True
+
+    def _wait_for_model_unloaded(
+        self,
+        model_name: str,
+        *,
+        timeout_seconds: float = _SYNC_UNLOAD_DEFAULT_TIMEOUT_SECONDS,
+        poll_interval_seconds: float = _SYNC_UNLOAD_DEFAULT_POLL_INTERVAL_SECONDS,
+    ) -> None:
+        deadline = time.monotonic() + timeout_seconds
+
+        while True:
+            if self._model_unloaded_in_triton(model_name):
+                return
+
+            if time.monotonic() >= deadline:
+                raise HotLoaderError(
+                    f"等待 Triton 完成 unload 超时 ({int(timeout_seconds)}s): {model_name}"
                 )
 
-        registration = self._register_loaded_model(model_name, image_ref)
-        self._update_job_state(
-            job_name,
-            status="TRITON_RELOAD_RUNNING",
-            model_name=model_name,
-            image=image_ref,
-            alias=registration["alias"],
-            detail="模型文件复制完成，正在请求 Triton load",
-            triton_ready=False,
-            error=None,
-        )
-        try:
-            self._load_model(model_name)
-            ready = self._model_ready_in_triton(model_name)
-        except Exception as exc:
-            self._rollback_loaded_model_registration(registration)
+            time.sleep(max(poll_interval_seconds, 0))
+
+    def _finalize_successful_job(self, job_name: str, model_name: str, image_ref: str) -> Dict[str, Any]:
+        with self._model_operation_lock(model_name):
+            cached_state = self._load_state().get("jobs", {}).get(job_name, {})
+            if isinstance(cached_state, Mapping):
+                final_status = cached_state.get("status")
+                if final_status in {"MODEL_READY", "TRITON_RELOAD_FAILED"}:
+                    return dict(cached_state)
+                if final_status == "TRITON_RELOAD_RUNNING":
+                    if self._model_ready_in_triton(model_name):
+                        return self._update_job_state(
+                            job_name,
+                            status="MODEL_READY",
+                            model_name=model_name,
+                            image=image_ref,
+                            detail="Triton 模型已完成 load/reload",
+                            triton_ready=True,
+                            error=None,
+                        )
+                    reload_attempts = int(cached_state.get("triton_reload_attempts") or 0) + 1
+                    reload_attempted_at = self._utc_now()
+                    try:
+                        self._load_model(model_name)
+                        ready = self._model_ready_in_triton(model_name)
+                    except Exception as exc:
+                        return self._update_job_state(
+                            job_name,
+                            status="TRITON_RELOAD_RUNNING",
+                            model_name=model_name,
+                            image=image_ref,
+                            detail=f"Triton 自动 reload 失败，将继续重试: {exc}",
+                            triton_ready=False,
+                            triton_reload_attempts=reload_attempts,
+                            triton_reload_last_attempt_at=reload_attempted_at,
+                            error=str(exc),
+                        )
+                    return self._update_job_state(
+                        job_name,
+                        status="MODEL_READY" if ready else "TRITON_RELOAD_RUNNING",
+                        model_name=model_name,
+                        image=image_ref,
+                        detail=(
+                            "Triton 模型已完成 load/reload"
+                            if ready
+                            else f"已自动触发 Triton reload 第 {reload_attempts} 次，正在等待模型变为 READY"
+                        ),
+                        triton_ready=ready,
+                        triton_reload_attempts=reload_attempts,
+                        triton_reload_last_attempt_at=reload_attempted_at,
+                        error=None,
+                    )
+
+            if self._uses_repository_sync_mode():
+                self._sync_model_from_job_repository(model_name)
+
+            registration = self._register_loaded_model(model_name, image_ref)
             self._update_job_state(
                 job_name,
-                status="TRITON_RELOAD_FAILED",
+                status="TRITON_RELOAD_RUNNING",
                 model_name=model_name,
                 image=image_ref,
-                error=str(exc),
+                alias=registration["alias"],
+                detail="模型文件复制完成，正在请求 Triton load",
+                triton_ready=False,
+                error=None,
             )
-            raise HotLoaderError(str(exc)) from exc
+            try:
+                self._load_model(model_name)
+                ready = self._model_ready_in_triton(model_name)
+            except Exception as exc:
+                self._rollback_loaded_model_registration(registration)
+                self._update_job_state(
+                    job_name,
+                    status="TRITON_RELOAD_FAILED",
+                    model_name=model_name,
+                    image=image_ref,
+                    error=str(exc),
+                )
+                raise HotLoaderError(str(exc)) from exc
 
-        return self._update_job_state(
-            job_name,
-            status="MODEL_READY" if ready else "TRITON_RELOAD_RUNNING",
-            model_name=model_name,
-            image=image_ref,
-            alias=registration["alias"],
-            triton_ready=ready,
-            triton_reload_attempts=1,
-            triton_reload_last_attempt_at=self._utc_now(),
-            detail="Triton 模型已完成 load/reload" if ready else "Triton 已收到 load 请求，正在等待模型变为 READY",
-            error=None,
-        )
+            return self._update_job_state(
+                job_name,
+                status="MODEL_READY" if ready else "TRITON_RELOAD_RUNNING",
+                model_name=model_name,
+                image=image_ref,
+                alias=registration["alias"],
+                triton_ready=ready,
+                triton_reload_attempts=1,
+                triton_reload_last_attempt_at=self._utc_now(),
+                detail="Triton 模型已完成 load/reload" if ready else "Triton 已收到 load 请求，正在等待模型变为 READY",
+                error=None,
+            )
 
     def create_model_copy_job(
         self,
@@ -1634,13 +1963,18 @@ class TritonHotLoader:
                 image_ref = str(cached.get("image") or "")
                 cached_status = str(cached.get("status") or "").upper()
                 model_dir = self.config.model_repository / model_name if model_name else None
-                if (
+                source_model_dir = self._job_repository_path() / model_name if model_name and self._uses_repository_sync_mode() else None
+                should_attempt_finalize = (
                     model_name
                     and image_ref
                     and cached_status in _ACTIVE_JOB_STATUSES
-                    and model_dir is not None
-                    and model_dir.exists()
-                ):
+                    and (
+                        self._uses_job_only_repository()
+                        or source_model_dir is not None
+                        or (model_dir is not None and model_dir.exists())
+                    )
+                )
+                if should_attempt_finalize:
                     try:
                         finalized = self._finalize_successful_job(job_name, model_name, image_ref)
                     except HotLoaderError as finalize_exc:
@@ -1662,6 +1996,9 @@ class TritonHotLoader:
                             ).strip("；"),
                         )
                     return self._sanitize_job_metadata(finalized)
+
+                if cached_status in _SYNC_LOAD_TERMINAL_STATUSES:
+                    return self._sanitize_job_metadata(cached)
 
                 cached["detail"] = f"Job 当前不可读，可能已被 TTL 清理: {self._exception_text(exc)}"
                 return self._sanitize_job_metadata(cached)
@@ -1880,6 +2217,13 @@ class TritonHotLoader:
         target_dir = self.config.model_repository / model_name
         if target_dir.exists():
             shutil.rmtree(target_dir, ignore_errors=True)
+
+        if self._uses_repository_sync_mode():
+            self._delete_model_directory_from_job_repository(model_name)
+            return
+
+        if self._uses_job_only_repository():
+            self._delete_model_directory_via_job(model_name)
 
     def _hydrate_state_aliases(self, state: Dict[str, Any]) -> Dict[str, Any]:
         aliases = state.setdefault("aliases", {})
@@ -2181,8 +2525,10 @@ class TritonHotLoader:
             models = sorted(set(current.get("models", [])))
 
         for model_name in models:
-            self._unload_model(model_name, tolerate_missing=True)
-            self._delete_model_directory(model_name)
+            with self._model_operation_lock(model_name):
+                self._unload_model(model_name, tolerate_missing=True)
+                self._wait_for_model_unloaded(model_name)
+                self._delete_model_directory(model_name)
 
         with self._state_lock:
             state = self._hydrate_state_aliases(self._load_state())
@@ -2228,8 +2574,10 @@ class TritonHotLoader:
         affected_aliases = []
 
         for model_name in unique_models:
-            self._unload_model(model_name, tolerate_missing=True)
-            self._delete_model_directory(model_name)
+            with self._model_operation_lock(model_name):
+                self._unload_model(model_name, tolerate_missing=True)
+                self._wait_for_model_unloaded(model_name)
+                self._delete_model_directory(model_name)
 
         with self._state_lock:
             state = self._hydrate_state_aliases(self._load_state())
@@ -2263,8 +2611,9 @@ class TritonHotLoader:
 
         reloaded = []
         for model_name in unique_models:
-            self._load_model(model_name)
-            reloaded.append(model_name)
+            with self._model_operation_lock(model_name):
+                self._load_model(model_name)
+                reloaded.append(model_name)
 
         return {
             "success": True,

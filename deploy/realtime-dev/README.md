@@ -42,13 +42,16 @@ kubectl get events -n default --field-selector involvedObject.name=<job-pod-name
 - 增加 `serviceAccountName: triton-controller-sa`
 - 删除 `docker.sock` 挂载
 - 删除 controller 对 `/var/run/docker.sock` 的依赖
+- Triton 在线 `model-store` 改为 `shared-volume` 临时目录
+- controller 同时挂载 `shared-volume` 临时目录和 Triton Repository PVC；动态 Job 仍只向 PVC 写模型，controller 再把 PVC 中的新模型同步到 `shared-volume`
 - 增加新的 controller 环境变量：
-  - `HOT_TRITON_MODEL_REPOSITORY=/repository/trt_models`
-  - `HOT_TRITON_STATE_FILE=/repository/.hot_loader/state.json`
-  - `HOT_TRITON_STAGING_ROOT=/repository/.staging`
+  - `HOT_TRITON_MODEL_REPOSITORY=/shared-volume/trt_models`
+  - `HOT_TRITON_STATE_FILE=/shared-volume/.hot_loader/state.json`
+  - `HOT_TRITON_STAGING_ROOT=/shared-volume/.staging`
   - `MODEL_SOURCE_PATH=/trt_models`
   - `MODEL_TARGET_PATH=/repository/trt_models`
   - `TRITON_REPOSITORY_PVC=triton-models-storage`
+  - `REPOSITORY_MAINTENANCE_IMAGE=ccr.ccs.tencentyun.com/clobotics/triton-hot-loader:<tag>`
   - `JOB_TOLERATIONS_JSON=[...]`
   - `JOB_TTL_SECONDS_AFTER_FINISHED=0`
   - `TRITON_URL=http://127.0.0.1:8000`

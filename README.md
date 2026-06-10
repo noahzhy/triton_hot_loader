@@ -69,6 +69,7 @@ MODEL_COPY_CPU_LIMIT=1
 MODEL_COPY_MEMORY_LIMIT=1Gi
 MAX_CONCURRENT_JOBS=0
 JOB_TOLERATIONS_JSON=[{"key":"gpu","operator":"Exists","effect":"NoSchedule"}]
+REPOSITORY_MAINTENANCE_IMAGE=ccr.ccs.tencentyun.com/clobotics/triton-hot-loader:latest
 ```
 
 说明：
@@ -84,6 +85,27 @@ JOB_TOLERATIONS_JSON=[{"key":"gpu","operator":"Exists","effect":"NoSchedule"}]
 - 线上建议保留 `JOB_TTL_SECONDS_AFTER_FINISHED=0`；排查复制或调度问题时，建议临时调大到 `300`，便于直接看 Job / Pod / Event。
 - 如果集群节点带 taint，需要通过 `JOB_TOLERATIONS_JSON` 给动态创建的 model-copy Job 补 tolerations。
 - Triton 必须使用 `EXPLICIT` 模式，且 `repository_poll_secs=0`。
+
+临时目录 Triton repository + PVC 同步模式：
+
+- 如果 Triton 的在线 `model-store` 必须放在临时目录，可以把 `HOT_TRITON_MODEL_REPOSITORY` 配成共享的 `emptyDir`，例如 `/shared-volume/trt_models`。
+- 只要 `HOT_TRITON_MODEL_REPOSITORY` 与 `MODEL_TARGET_PATH` 不同，controller 就会自动切换到 repository sync 模式：`load/load-batch` 先通过 model-copy Job 把模型复制到 `TRITON_REPOSITORY_PVC`，然后 controller 再把 `${MODEL_TARGET_PATH}/${MODEL_NAME}` 同步到本地临时目录，最后调用 Triton load。
+- 这种模式下，controller 需要同时挂载：
+  - 临时目录，例如 `shared-volume -> /shared-volume`
+  - Triton Repository PVC，例如 `triton-repository -> /repository`
+- 推荐配置：
+
+```env
+HOT_TRITON_MODEL_REPOSITORY=/shared-volume/trt_models
+HOT_TRITON_STATE_FILE=/shared-volume/.hot_loader/state.json
+HOT_TRITON_STAGING_ROOT=/shared-volume/.staging
+MODEL_TARGET_PATH=/repository/trt_models
+TRITON_REPOSITORY_PVC=triton-repository-pvc
+REPOSITORY_MAINTENANCE_IMAGE=ccr.ccs.tencentyun.com/clobotics/triton-hot-loader:latest
+```
+
+- 这种模式下 Triton 自己只需要挂 `shared-volume`；不需要直接读 PVC。
+- `REPOSITORY_MAINTENANCE_IMAGE` 只在 controller 看不到 PVC 挂载点时，才会退回到 cleanup Job 清理 PVC 中的模型目录；如果 controller 已经挂了 `/repository`，卸载时会直接删除本地临时目录和 PVC 目录。
 
 ## HTTP API
 
