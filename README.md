@@ -15,6 +15,12 @@
 
 同名模型现在采用直接替换语义：无论镜像新旧，只要解析出的 `model_name` 相同，就覆盖当前仓库里的同名模型；controller 不再对同名模型做额外版本管理。
 
+## 文档入口
+
+- 运维简要配置与说明: [docs/ops/README.md](docs/ops/README.md)
+- CLI 使用说明: [docs/cli/README.md](docs/cli/README.md)
+- realtime-dev 部署说明: [deploy/realtime-dev/README.md](deploy/realtime-dev/README.md)
+
 ## 架构
 
 ```text

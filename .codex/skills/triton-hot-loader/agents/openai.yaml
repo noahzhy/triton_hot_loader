@@ -1,7 +1,7 @@
 interface:
   display_name: "Triton Hot Loader"
-  short_description: "维护这个仓库里的 Triton 热加载 CLI、API 与文档。"
-  default_prompt: "Use $triton-hot-loader to explain, update, or debug the CLI and runtime workflow in this repository."
+  short_description: "维护这个仓库里的 Triton 热加载 CLI、API、运维与 PVC 同步文档。"
+  default_prompt: "Use $triton-hot-loader to explain, update, or debug the CLI, HTTP API, callback flow, or runtime/PVC sync workflow in this repository."
 
 policy:
   allow_implicit_invocation: true
