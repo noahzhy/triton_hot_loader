@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from hot_loader import HotLoaderConfig, HotLoaderError, TritonHotLoader
+from hot_loader import HotLoaderConfig, HotLoaderConflictError, HotLoaderError, TritonHotLoader
 
 
 TRITON_URL_OVERRIDE_HEADER = "x-hot-triton-url"
@@ -288,7 +288,8 @@ def create_app(loader: TritonHotLoader | None = None, *, enable_background_worke
 
     @app.exception_handler(HotLoaderError)
     async def hot_loader_exception_handler(_: Request, exc: HotLoaderError) -> JSONResponse:
-        return JSONResponse(status_code=400, content={"success": False, "detail": str(exc)})
+        status_code = 409 if isinstance(exc, HotLoaderConflictError) else 400
+        return JSONResponse(status_code=status_code, content={"success": False, "detail": str(exc)})
 
     @app.get("/", include_in_schema=False)
     async def index() -> FileResponse:

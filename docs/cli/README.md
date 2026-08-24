@@ -31,6 +31,10 @@ python3 cli.py --help
 - `--model-copy-cpu-limit`
 - `--model-copy-memory-limit`
 - `--max-concurrent-jobs`
+- `--triton-reload-max-attempts`
+- `--triton-reload-retry-base-seconds`
+- `--triton-reload-retry-max-seconds`
+- `--triton-reload-timeout-seconds`
 - `--request-timeout`
 
 补充环境变量：
@@ -132,6 +136,7 @@ python3 cli.py unload --aliases model_demo_model
 说明：
 
 - 同名模型现在总是直接替换，不再支持 `model_name@version` 级别的版本卸载。
+- `unload` 仅改变 Triton 运行态，不删除 PVC 模型目录或 controller 管理映射；同一模型可直接用 `reload` 恢复。
 
 ### `reload`
 
@@ -169,12 +174,11 @@ export HOT_TRITON_STATE_FILE=/shared-volume/.hot_loader/state.json
 export HOT_TRITON_STAGING_ROOT=/shared-volume/.staging
 export MODEL_TARGET_PATH=/repository/trt_models
 export TRITON_REPOSITORY_PVC=triton-repository-pvc
-export REPOSITORY_MAINTENANCE_IMAGE=ccr.ccs.tencentyun.com/clobotics/triton-hot-loader:latest
 ```
 
 - 这种模式下 controller 需要同时挂载临时目录和 `/repository` 对应的 PVC 路径；Triton 只需要挂载临时目录。
-- 其中 `REPOSITORY_MAINTENANCE_IMAGE` 只在 controller 看不到 PVC 挂载点时，才会退回到 cleanup Job 使用。
 - `--max-concurrent-jobs` 或 `MAX_CONCURRENT_JOBS` 只有在设置为正整数时才会限流；`0` 表示不限制，这也是当前默认值。
+- reload 默认最多尝试 8 次，按 2 秒起步、60 秒封顶的指数退避等待目标版本 READY，总时限为 600 秒；可用四个 `--triton-reload-*` 参数或对应环境变量调整。
 - 如需任务完成后立即自动删除，可设置 `JOB_TTL_SECONDS_AFTER_FINISHED=0`；这也是当前示例部署的默认值。
 - 即使 Job 已被 TTL 删除，只要模型目录已经复制完成，controller 仍会继续自动推进 Triton load/reload。
 - 调试调度、拉镜像或复制问题时，建议临时把 `JOB_TTL_SECONDS_AFTER_FINISHED` 调大到 `300`，这样 Job / Pod / Event 不会立刻消失。

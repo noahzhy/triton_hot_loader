@@ -61,8 +61,11 @@ K8S_NAMESPACE=default
 - `MODEL_COPY_CPU_LIMIT=1`
 - `MODEL_COPY_MEMORY_LIMIT=1Gi`
 - `MAX_CONCURRENT_JOBS=0`
+- `TRITON_RELOAD_MAX_ATTEMPTS=8`
+- `TRITON_RELOAD_RETRY_BASE_SECONDS=2`
+- `TRITON_RELOAD_RETRY_MAX_SECONDS=60`
+- `TRITON_RELOAD_TIMEOUT_SECONDS=600`
 - `JOB_TOLERATIONS_JSON=[...]`
-- `REPOSITORY_MAINTENANCE_IMAGE=...`
 
 完整示例见 [controller.env.example](./controller.env.example)。
 
@@ -109,8 +112,8 @@ kubectl logs -n default deployment/trtis-deployment-realtime-dev -c triton-contr
   检查 `--model-control-mode=EXPLICIT` 和 `--repository-poll-secs=0`
 - Job 卡在 `IMAGE_PULLING` 或 `SCHEDULING`:
   运行 `kubectl describe pod` 和 `kubectl get events`
-- 卸载时报缺辅助镜像:
-  补 `REPOSITORY_MAINTENANCE_IMAGE`
+- Job 长时间处于 `TRITON_RELOAD_RUNNING`:
+  查看 `triton_reload_attempts`、`triton_reload_next_attempt_at` 和 `error`；达到配置上限后会固定为 `TRITON_RELOAD_FAILED`
 - Triton 仓库里出现 `.hot_loader` 或 `.staging`:
   把状态文件和 staging 目录移到模型目录外层
 

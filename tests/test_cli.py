@@ -14,6 +14,10 @@ class CliConfigTests(unittest.TestCase):
                 "TRITON_REPOSITORY_PVC": "triton-models-storage",
                 "MODEL_TARGET_PATH": "/repository/trt_models",
                 "MODEL_COPY_IMAGE_PULL_POLICY": "Always",
+                "TRITON_RELOAD_MAX_ATTEMPTS": "4",
+                "TRITON_RELOAD_RETRY_BASE_SECONDS": "3",
+                "TRITON_RELOAD_RETRY_MAX_SECONDS": "30",
+                "TRITON_RELOAD_TIMEOUT_SECONDS": "180",
                 "REPOSITORY_MAINTENANCE_IMAGE": "ccr.ccs.tencentyun.com/clobotics/triton-hot-loader:helper",
                 "JOB_TOLERATIONS_JSON": (
                     '[{"key":"gpu","operator":"Exists","effect":"NoSchedule"},'
@@ -28,6 +32,10 @@ class CliConfigTests(unittest.TestCase):
         self.assertEqual(config.triton_repository_pvc, "triton-models-storage")
         self.assertEqual(config.model_target_path, "/repository/trt_models")
         self.assertEqual(config.job_image_pull_policy, "Always")
+        self.assertEqual(config.triton_reload_max_attempts, 4)
+        self.assertEqual(config.triton_reload_retry_base_seconds, 3)
+        self.assertEqual(config.triton_reload_retry_max_seconds, 30)
+        self.assertEqual(config.triton_reload_timeout_seconds, 180)
         self.assertEqual(
             config.repository_maintenance_image,
             "ccr.ccs.tencentyun.com/clobotics/triton-hot-loader:helper",

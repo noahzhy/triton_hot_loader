@@ -74,8 +74,11 @@ MODEL_COPY_MEMORY_REQUEST=256Mi
 MODEL_COPY_CPU_LIMIT=1
 MODEL_COPY_MEMORY_LIMIT=1Gi
 MAX_CONCURRENT_JOBS=0
+TRITON_RELOAD_MAX_ATTEMPTS=8
+TRITON_RELOAD_RETRY_BASE_SECONDS=2
+TRITON_RELOAD_RETRY_MAX_SECONDS=60
+TRITON_RELOAD_TIMEOUT_SECONDS=600
 JOB_TOLERATIONS_JSON=[{"key":"gpu","operator":"Exists","effect":"NoSchedule"}]
-REPOSITORY_MAINTENANCE_IMAGE=ccr.ccs.tencentyun.com/clobotics/triton-hot-loader:latest
 ```
 
 说明：
@@ -88,6 +91,7 @@ REPOSITORY_MAINTENANCE_IMAGE=ccr.ccs.tencentyun.com/clobotics/triton-hot-loader:
 - 当 `MODEL_TARGET_PATH` 是 `/repository/trt_models` 这种 PVC 子目录时，model-copy Job 会把 PVC 挂到它的父目录 `/repository`，然后再复制到 `${MODEL_TARGET_PATH}/${MODEL_NAME}`。
 - `JOB_TTL_SECONDS_AFTER_FINISHED=0` 表示 Job 一旦进入完成态就立即交给 TTL controller 删除；controller 自己的状态文件仍会保留最近一次结果摘要。
 - 即使复制 Job 已被 TTL 清理，只要模型目录已经落盘，controller 仍会继续自动推进后续的 Triton load/reload 状态机。
+- reload 只确认本次复制记录的目标版本；同名旧版本的状态不会决定当前 operation。默认最多 8 次、以 2 秒起步并封顶 60 秒的指数退避等待 READY，总时限 600 秒。
 - 线上建议保留 `JOB_TTL_SECONDS_AFTER_FINISHED=0`；排查复制或调度问题时，建议临时调大到 `300`，便于直接看 Job / Pod / Event。
 - 如果集群节点带 taint，需要通过 `JOB_TOLERATIONS_JSON` 给动态创建的 model-copy Job 补 tolerations。
 - Triton 必须使用 `EXPLICIT` 模式，且 `repository_poll_secs=0`。
@@ -107,11 +111,10 @@ HOT_TRITON_STATE_FILE=/shared-volume/.hot_loader/state.json
 HOT_TRITON_STAGING_ROOT=/shared-volume/.staging
 MODEL_TARGET_PATH=/repository/trt_models
 TRITON_REPOSITORY_PVC=triton-repository-pvc
-REPOSITORY_MAINTENANCE_IMAGE=ccr.ccs.tencentyun.com/clobotics/triton-hot-loader:latest
 ```
 
 - 这种模式下 Triton 自己只需要挂 `shared-volume`；不需要直接读 PVC。
-- `REPOSITORY_MAINTENANCE_IMAGE` 只在 controller 看不到 PVC 挂载点时，才会退回到 cleanup Job 清理 PVC 中的模型目录；如果 controller 已经挂了 `/repository`，卸载时会直接删除本地临时目录和 PVC 目录。
+- `unload` 始终只改变 Triton 运行态，不会删除 PVC 或临时目录中的模型文件，也不会清除镜像映射；可以直接调用 `reload` 恢复。
 
 ## HTTP API
 
@@ -171,7 +174,9 @@ POST /api/models/load-batch
 
 - `model_name` 现在是可选字段；如果不传，controller 会优先从 image tag 提取。
 - `wait_for_ready` 默认是 `false`；设为 `true` 时，接口会阻塞到 Triton 最终进入终态。
+- 相同 `model_name + image` 的活跃重复请求会返回原有 Job（`reused: true`），不会创建第二个复制 Job；同一模型的不同镜像在前一 operation 未结束时返回 HTTP 409。
 - 提取规则会去掉 tag 末尾常见的日期/时间发布后缀，例如 `unit_empty_space_uspg_yolov8-20260430 -> unit_empty_space_uspg_yolov8`。
+- 对以 `-YYYYMMDD` 结尾的镜像 tag，controller 会预先记录该版本为本次 operation 的目标版本；model-copy Job 完成后会以实际复制出的数字版本目录覆盖确认。
 - tag 中的 `-`、`.` 会统一规整成 `_`，例如 `model-a -> model_a`。
 - 如果新请求解析出的 `model_name` 与当前已加载模型同名，controller 会直接替换旧模型，不保留同名历史版本。
 - `callback` 是可选对象；当前只支持 `terminal` 事件，也就是 `MODEL_READY`、`COPY_FAILED`、`TRITON_RELOAD_FAILED` 这三类终态回调。
@@ -201,9 +206,11 @@ POST /api/models/load-batch
   "model_name": "unit_empty_space_uspg_yolov8",
   "image": "ccr.ccs.tencentyun.com/clobotics/unit-model-init:unit_empty_space_uspg_yolov8-20260430",
   "status": "MODEL_READY",
-  "detail": "Triton 模型已完成 load/reload",
+  "detail": "Triton 已确认本次交付的目标版本 READY",
   "terminal": true,
   "triton_ready": true,
+  "target_versions": ["20260430"],
+  "triton_reload_attempts": 1,
   "updated_at": "2026-06-09T09:58:10+00:00",
   "callback_attempt": 1
 }
@@ -277,6 +284,8 @@ curl -X POST "${BASE_URL}/api/models/unload" \
   }'
 ```
 
+`unload` 只卸载 Triton 运行态：PVC 中的模型文件和 controller 的镜像映射都会保留。随后调用 `reload` 即可直接恢复，无需再次创建 model-copy Job。
+
 批量卸载模型：
 
 ```bash
@@ -335,6 +344,10 @@ POST /api/models/reload
   "model_name": "unit_empty_space_uspg_yolov8"
 }
 ```
+
+### reload 重试与状态
+
+模型文件复制完成后，controller 只会确认本次复制交付的 `target_versions` 是否 READY；不会因同名旧版本状态而提前返回。未就绪时使用指数退避重试，默认最多 8 次、起始间隔 2 秒、单次间隔上限 60 秒、总时限 10 分钟。状态响应会返回 `triton_reload_attempts`、`triton_reload_last_attempt_at`、`triton_reload_next_attempt_at` 和最后一次 `error`；达到次数或时限后状态固定为 `TRITON_RELOAD_FAILED`。
 
 ### GPU / Triton 指标
 

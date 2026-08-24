@@ -22,6 +22,10 @@ class HotLoaderError(RuntimeError):
     """Raised when a hot-loading operation fails."""
 
 
+class HotLoaderConflictError(HotLoaderError):
+    """Raised when a model already has a different active operation."""
+
+
 _ALIAS_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 _TRITON_VERSION_DIR_PATTERN = re.compile(r"^\d+$")
 _MODEL_VERSION_REF_PATTERN = re.compile(r"^(?P<model>[^@\s][^@]*)@(?P<version>\d+)$")
@@ -54,6 +58,10 @@ _MODEL_COPY_MEMORY_REQUEST_ENV_NAMES = ("MODEL_COPY_MEMORY_REQUEST",)
 _MODEL_COPY_CPU_LIMIT_ENV_NAMES = ("MODEL_COPY_CPU_LIMIT",)
 _MODEL_COPY_MEMORY_LIMIT_ENV_NAMES = ("MODEL_COPY_MEMORY_LIMIT",)
 _MAX_CONCURRENT_JOBS_ENV_NAMES = ("MAX_CONCURRENT_JOBS",)
+_TRITON_RELOAD_MAX_ATTEMPTS_ENV_NAMES = ("TRITON_RELOAD_MAX_ATTEMPTS",)
+_TRITON_RELOAD_RETRY_BASE_SECONDS_ENV_NAMES = ("TRITON_RELOAD_RETRY_BASE_SECONDS",)
+_TRITON_RELOAD_RETRY_MAX_SECONDS_ENV_NAMES = ("TRITON_RELOAD_RETRY_MAX_SECONDS",)
+_TRITON_RELOAD_TIMEOUT_SECONDS_ENV_NAMES = ("TRITON_RELOAD_TIMEOUT_SECONDS",)
 _JOB_IMAGE_PULL_POLICY_ENV_NAMES = ("MODEL_COPY_IMAGE_PULL_POLICY",)
 _JOB_TOLERATIONS_ENV_NAMES = ("JOB_TOLERATIONS_JSON",)
 _REPOSITORY_MAINTENANCE_IMAGE_ENV_NAMES = ("REPOSITORY_MAINTENANCE_IMAGE",)
@@ -65,6 +73,10 @@ _IMAGE_TAG_RELEASE_SUFFIX_PATTERN = re.compile(r"(?:[-_])\d{8}(?:[-_]\d{6})?$")
 _MODEL_NAME_DERIVE_SANITIZE_PATTERN = re.compile(r"[^a-z0-9_]+")
 _REPOSITORY_JOB_TERMINAL_POLL_INTERVAL_SECONDS = 2.0
 _REPOSITORY_JOB_TIMEOUT_SECONDS = 300.0
+_TRITON_RELOAD_DEFAULT_MAX_ATTEMPTS = 8
+_TRITON_RELOAD_DEFAULT_RETRY_BASE_SECONDS = 2.0
+_TRITON_RELOAD_DEFAULT_RETRY_MAX_SECONDS = 60.0
+_TRITON_RELOAD_DEFAULT_TIMEOUT_SECONDS = 600.0
 
 _EXPLICIT_CONTROL_HINT = (
     "当前 Triton 不允许通过 API 显式执行 load/unload。\n"
@@ -352,6 +364,10 @@ class HotLoaderConfig:
     model_copy_cpu_limit: str = "1"
     model_copy_memory_limit: str = "1Gi"
     max_concurrent_jobs: int = 0
+    triton_reload_max_attempts: int = _TRITON_RELOAD_DEFAULT_MAX_ATTEMPTS
+    triton_reload_retry_base_seconds: float = _TRITON_RELOAD_DEFAULT_RETRY_BASE_SECONDS
+    triton_reload_retry_max_seconds: float = _TRITON_RELOAD_DEFAULT_RETRY_MAX_SECONDS
+    triton_reload_timeout_seconds: float = _TRITON_RELOAD_DEFAULT_TIMEOUT_SECONDS
     job_image_pull_policy: str = "IfNotPresent"
     job_tolerations: List[Dict[str, Any]] = field(default_factory=list)
     repository_maintenance_image: str | None = None
@@ -367,6 +383,14 @@ class HotLoaderConfig:
         self.repository_maintenance_image = (
             self.repository_maintenance_image.strip() if self.repository_maintenance_image else None
         ) or None
+        if self.triton_reload_max_attempts < 1:
+            raise HotLoaderError("triton_reload_max_attempts 必须大于等于 1")
+        if self.triton_reload_retry_base_seconds <= 0:
+            raise HotLoaderError("triton_reload_retry_base_seconds 必须大于 0")
+        if self.triton_reload_retry_max_seconds < self.triton_reload_retry_base_seconds:
+            raise HotLoaderError("triton_reload_retry_max_seconds 不能小于 triton_reload_retry_base_seconds")
+        if self.triton_reload_timeout_seconds <= 0:
+            raise HotLoaderError("triton_reload_timeout_seconds 必须大于 0")
         self.job_tolerations = _normalize_job_tolerations(
             self.job_tolerations,
             source_name="job_tolerations",
@@ -396,6 +420,22 @@ class HotLoaderConfig:
             model_copy_cpu_limit=_env_default(*_MODEL_COPY_CPU_LIMIT_ENV_NAMES) or "1",
             model_copy_memory_limit=_env_default(*_MODEL_COPY_MEMORY_LIMIT_ENV_NAMES) or "1Gi",
             max_concurrent_jobs=int(_env_default(*_MAX_CONCURRENT_JOBS_ENV_NAMES) or "0"),
+            triton_reload_max_attempts=int(
+                _env_default(*_TRITON_RELOAD_MAX_ATTEMPTS_ENV_NAMES)
+                or str(_TRITON_RELOAD_DEFAULT_MAX_ATTEMPTS)
+            ),
+            triton_reload_retry_base_seconds=float(
+                _env_default(*_TRITON_RELOAD_RETRY_BASE_SECONDS_ENV_NAMES)
+                or str(_TRITON_RELOAD_DEFAULT_RETRY_BASE_SECONDS)
+            ),
+            triton_reload_retry_max_seconds=float(
+                _env_default(*_TRITON_RELOAD_RETRY_MAX_SECONDS_ENV_NAMES)
+                or str(_TRITON_RELOAD_DEFAULT_RETRY_MAX_SECONDS)
+            ),
+            triton_reload_timeout_seconds=float(
+                _env_default(*_TRITON_RELOAD_TIMEOUT_SECONDS_ENV_NAMES)
+                or str(_TRITON_RELOAD_DEFAULT_TIMEOUT_SECONDS)
+            ),
             job_image_pull_policy=_env_default(*_JOB_IMAGE_PULL_POLICY_ENV_NAMES) or "IfNotPresent",
             job_tolerations=_parse_job_tolerations(
                 _env_default(*_JOB_TOLERATIONS_ENV_NAMES),
@@ -423,6 +463,10 @@ class HotLoaderConfig:
             "model_copy_cpu_limit": self.model_copy_cpu_limit,
             "model_copy_memory_limit": self.model_copy_memory_limit,
             "max_concurrent_jobs": self.max_concurrent_jobs,
+            "triton_reload_max_attempts": self.triton_reload_max_attempts,
+            "triton_reload_retry_base_seconds": self.triton_reload_retry_base_seconds,
+            "triton_reload_retry_max_seconds": self.triton_reload_retry_max_seconds,
+            "triton_reload_timeout_seconds": self.triton_reload_timeout_seconds,
             "job_image_pull_policy": self.job_image_pull_policy,
             "job_tolerations": self.job_tolerations,
             "repository_maintenance_image": self.repository_maintenance_image,
@@ -1107,7 +1151,15 @@ class TritonHotLoader:
                 '  if [ -d "${BACKUP_DIR}" ] && [ ! -d "${TARGET_DIR}" ]; then mv "${BACKUP_DIR}" "${TARGET_DIR}" || true; fi',
                 "  exit 1",
                 "fi",
-                'echo "model copy done"',
+                'TARGET_VERSIONS=""',
+                'for VERSION_DIR in "${TARGET_DIR}"/*; do',
+                '  [ -d "${VERSION_DIR}" ] || continue',
+                '  VERSION="${VERSION_DIR##*/}"',
+                '  case "${VERSION}" in ""|*[!0-9]*) continue ;; esac',
+                '  TARGET_VERSIONS="${TARGET_VERSIONS}${TARGET_VERSIONS:+,}${VERSION}"',
+                'done',
+                'if [ -z "${TARGET_VERSIONS}" ]; then echo "no numeric Triton model versions found"; exit 1; fi',
+                'echo "model copy done target_versions=${TARGET_VERSIONS}"',
             ]
         )
 
@@ -1631,12 +1683,42 @@ class TritonHotLoader:
 
         return "JOB_CREATED", self._latest_event_detail(events) or "Job 已创建，等待 Kubernetes 调度"
 
-    def _model_ready_in_triton(self, model_name: str) -> bool:
+    @staticmethod
+    def _normalize_target_versions(versions: Iterable[Any] | None) -> List[str]:
+        if versions is None:
+            return []
+        return sorted({str(version) for version in versions if str(version).isdigit()}, key=int)
+
+    @staticmethod
+    def _target_versions_from_copy_logs(logs: str | None) -> List[str]:
+        if not logs:
+            return []
+        matches = re.findall(r"(?:^|\s)target_versions=([0-9][0-9,]*)(?:\s|$)", logs)
+        if not matches:
+            return []
+        return TritonHotLoader._normalize_target_versions(matches[-1].split(","))
+
+    @staticmethod
+    def _target_versions_from_image(image_ref: str) -> List[str]:
+        tag = image_ref.rsplit(":", 1)[-1]
+        match = re.search(r"(?:^|[-_])(\d{8})(?:[-_]\d{6})?$", tag)
+        return [match.group(1)] if match else []
+
+    def _model_ready_in_triton(
+        self,
+        model_name: str,
+        *,
+        target_versions: Iterable[Any] | None = None,
+    ) -> bool:
+        expected_versions = set(self._normalize_target_versions(target_versions))
         for item in self.list_repository_models(safe=True):
             if item.get("name") != model_name:
                 continue
+            if expected_versions and str(item.get("version") or "") not in expected_versions:
+                continue
             state_text = str(item.get("state") or "").upper()
-            return state_text == "READY"
+            if state_text == "READY":
+                return True
         return False
 
     def _model_unloaded_in_triton(self, model_name: str) -> bool:
@@ -1670,55 +1752,206 @@ class TritonHotLoader:
 
             time.sleep(max(poll_interval_seconds, 0))
 
-    def _finalize_successful_job(self, job_name: str, model_name: str, image_ref: str) -> Dict[str, Any]:
+    def _retry_delay_seconds(self, attempts: int) -> float:
+        exponent = max(attempts - 1, 0)
+        return min(
+            self.config.triton_reload_retry_max_seconds,
+            self.config.triton_reload_retry_base_seconds * (2 ** exponent),
+        )
+
+    @staticmethod
+    def _parse_utc_timestamp(value: Any) -> datetime | None:
+        if not isinstance(value, str) or not value.strip():
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+    def _reload_deadline_exceeded(self, cached_state: Mapping[str, Any], now: datetime) -> bool:
+        started_at = self._parse_utc_timestamp(cached_state.get("triton_reload_started_at"))
+        return started_at is not None and now >= started_at + timedelta(
+            seconds=self.config.triton_reload_timeout_seconds
+        )
+
+    def _update_ready_job(
+        self,
+        job_name: str,
+        model_name: str,
+        image_ref: str,
+        *,
+        target_versions: Sequence[str],
+        alias: str | None = None,
+        triton_reload_attempts: int | None = None,
+    ) -> Dict[str, Any]:
+        updates: Dict[str, Any] = {
+            "status": "MODEL_READY",
+            "model_name": model_name,
+            "image": image_ref,
+            "target_versions": list(target_versions),
+            "detail": "Triton 已确认本次交付的目标版本 READY",
+            "triton_ready": True,
+            "triton_reload_next_attempt_at": None,
+            "error": None,
+        }
+        if alias is not None:
+            updates["alias"] = alias
+        if triton_reload_attempts is not None:
+            updates["triton_reload_attempts"] = triton_reload_attempts
+        return self._update_job_state(job_name, **updates)
+
+    def _update_reload_failed_job(
+        self,
+        job_name: str,
+        model_name: str,
+        image_ref: str,
+        *,
+        target_versions: Sequence[str],
+        detail: str,
+    ) -> Dict[str, Any]:
+        return self._update_job_state(
+            job_name,
+            status="TRITON_RELOAD_FAILED",
+            model_name=model_name,
+            image=image_ref,
+            target_versions=list(target_versions),
+            detail=detail,
+            triton_ready=False,
+            triton_reload_next_attempt_at=None,
+            error=detail,
+        )
+
+    def _schedule_reload_retry(
+        self,
+        job_name: str,
+        model_name: str,
+        image_ref: str,
+        *,
+        target_versions: Sequence[str],
+        attempts: int,
+        started_at: str,
+        last_attempt_at: str,
+        error: str | None = None,
+    ) -> Dict[str, Any]:
+        next_attempt_at = (datetime.now(timezone.utc) + timedelta(seconds=self._retry_delay_seconds(attempts))).isoformat()
+        detail = (
+            f"Triton reload 第 {attempts}/{self.config.triton_reload_max_attempts} 次未就绪；"
+            f"将在 {next_attempt_at} 后重试"
+        )
+        if error:
+            detail = f"{detail}: {error}"
+        return self._update_job_state(
+            job_name,
+            status="TRITON_RELOAD_RUNNING",
+            model_name=model_name,
+            image=image_ref,
+            target_versions=list(target_versions),
+            detail=detail,
+            triton_ready=False,
+            triton_reload_attempts=attempts,
+            triton_reload_started_at=started_at,
+            triton_reload_last_attempt_at=last_attempt_at,
+            triton_reload_next_attempt_at=next_attempt_at,
+            error=error,
+        )
+
+    def _finalize_successful_job(
+        self,
+        job_name: str,
+        model_name: str,
+        image_ref: str,
+        *,
+        target_versions: Iterable[Any] | None = None,
+    ) -> Dict[str, Any]:
         with self._model_operation_lock(model_name):
             cached_state = self._load_state().get("jobs", {}).get(job_name, {})
+            resolved_target_versions = self._normalize_target_versions(target_versions)
             if isinstance(cached_state, Mapping):
-                final_status = cached_state.get("status")
+                final_status = str(cached_state.get("status") or "").upper()
+                if not resolved_target_versions:
+                    resolved_target_versions = self._normalize_target_versions(cached_state.get("target_versions"))
                 if final_status in {"MODEL_READY", "TRITON_RELOAD_FAILED"}:
                     return dict(cached_state)
                 if final_status == "TRITON_RELOAD_RUNNING":
-                    if self._model_ready_in_triton(model_name):
-                        return self._update_job_state(
+                    if self._model_ready_in_triton(model_name, target_versions=resolved_target_versions):
+                        return self._update_ready_job(
                             job_name,
-                            status="MODEL_READY",
-                            model_name=model_name,
-                            image=image_ref,
-                            detail="Triton 模型已完成 load/reload",
-                            triton_ready=True,
-                            error=None,
+                            model_name,
+                            image_ref,
+                            target_versions=resolved_target_versions,
+                            triton_reload_attempts=int(cached_state.get("triton_reload_attempts") or 0),
                         )
-                    reload_attempts = int(cached_state.get("triton_reload_attempts") or 0) + 1
-                    reload_attempted_at = self._utc_now()
+                    now = datetime.now(timezone.utc)
+                    attempts = int(cached_state.get("triton_reload_attempts") or 0)
+                    if attempts >= self.config.triton_reload_max_attempts:
+                        return self._update_reload_failed_job(
+                            job_name,
+                            model_name,
+                            image_ref,
+                            target_versions=resolved_target_versions,
+                            detail=f"Triton reload 超过最大尝试次数 {self.config.triton_reload_max_attempts}",
+                        )
+                    if self._reload_deadline_exceeded(cached_state, now):
+                        return self._update_reload_failed_job(
+                            job_name,
+                            model_name,
+                            image_ref,
+                            target_versions=resolved_target_versions,
+                            detail=f"等待 Triton 目标版本 READY 超时 ({int(self.config.triton_reload_timeout_seconds)}s)",
+                        )
+                    next_attempt_at = self._parse_utc_timestamp(cached_state.get("triton_reload_next_attempt_at"))
+                    if next_attempt_at is not None and now < next_attempt_at:
+                        return dict(cached_state)
+                    reload_attempts = attempts + 1
+                    reload_attempted_at = now.isoformat()
+                    started_at = str(cached_state.get("triton_reload_started_at") or reload_attempted_at)
                     try:
                         self._load_model(model_name)
-                        ready = self._model_ready_in_triton(model_name)
+                        ready = self._model_ready_in_triton(model_name, target_versions=resolved_target_versions)
                     except Exception as exc:
-                        return self._update_job_state(
+                        if reload_attempts >= self.config.triton_reload_max_attempts:
+                            return self._update_reload_failed_job(
+                                job_name,
+                                model_name,
+                                image_ref,
+                                target_versions=resolved_target_versions,
+                                detail=f"Triton reload 第 {reload_attempts} 次失败: {exc}",
+                            )
+                        return self._schedule_reload_retry(
                             job_name,
-                            status="TRITON_RELOAD_RUNNING",
-                            model_name=model_name,
-                            image=image_ref,
-                            detail=f"Triton 自动 reload 失败，将继续重试: {exc}",
-                            triton_ready=False,
-                            triton_reload_attempts=reload_attempts,
-                            triton_reload_last_attempt_at=reload_attempted_at,
+                            model_name,
+                            image_ref,
+                            target_versions=resolved_target_versions,
+                            attempts=reload_attempts,
+                            started_at=started_at,
+                            last_attempt_at=reload_attempted_at,
                             error=str(exc),
                         )
-                    return self._update_job_state(
+                    if ready:
+                        return self._update_ready_job(
+                            job_name,
+                            model_name,
+                            image_ref,
+                            target_versions=resolved_target_versions,
+                            triton_reload_attempts=reload_attempts,
+                        )
+                    if reload_attempts >= self.config.triton_reload_max_attempts:
+                        return self._update_reload_failed_job(
+                            job_name,
+                            model_name,
+                            image_ref,
+                            target_versions=resolved_target_versions,
+                            detail=f"Triton reload 第 {reload_attempts} 次后目标版本仍未 READY",
+                        )
+                    return self._schedule_reload_retry(
                         job_name,
-                        status="MODEL_READY" if ready else "TRITON_RELOAD_RUNNING",
-                        model_name=model_name,
-                        image=image_ref,
-                        detail=(
-                            "Triton 模型已完成 load/reload"
-                            if ready
-                            else f"已自动触发 Triton reload 第 {reload_attempts} 次，正在等待模型变为 READY"
-                        ),
-                        triton_ready=ready,
-                        triton_reload_attempts=reload_attempts,
-                        triton_reload_last_attempt_at=reload_attempted_at,
-                        error=None,
+                        model_name,
+                        image_ref,
+                        target_versions=resolved_target_versions,
+                        attempts=reload_attempts,
+                        started_at=started_at,
+                        last_attempt_at=reload_attempted_at,
                     )
 
             if self._uses_repository_sync_mode():
@@ -1737,29 +1970,38 @@ class TritonHotLoader:
             )
             try:
                 self._load_model(model_name)
-                ready = self._model_ready_in_triton(model_name)
+                ready = self._model_ready_in_triton(model_name, target_versions=resolved_target_versions)
             except Exception as exc:
-                self._rollback_loaded_model_registration(registration)
-                self._update_job_state(
+                attempted_at = self._utc_now()
+                return self._schedule_reload_retry(
                     job_name,
-                    status="TRITON_RELOAD_FAILED",
-                    model_name=model_name,
-                    image=image_ref,
+                    model_name,
+                    image_ref,
+                    target_versions=resolved_target_versions,
+                    attempts=1,
+                    started_at=attempted_at,
+                    last_attempt_at=attempted_at,
                     error=str(exc),
                 )
-                raise HotLoaderError(str(exc)) from exc
 
-            return self._update_job_state(
+            if ready:
+                return self._update_ready_job(
+                    job_name,
+                    model_name,
+                    image_ref,
+                    target_versions=resolved_target_versions,
+                    alias=registration["alias"],
+                    triton_reload_attempts=1,
+                )
+            attempted_at = self._utc_now()
+            return self._schedule_reload_retry(
                 job_name,
-                status="MODEL_READY" if ready else "TRITON_RELOAD_RUNNING",
-                model_name=model_name,
-                image=image_ref,
-                alias=registration["alias"],
-                triton_ready=ready,
-                triton_reload_attempts=1,
-                triton_reload_last_attempt_at=self._utc_now(),
-                detail="Triton 模型已完成 load/reload" if ready else "Triton 已收到 load 请求，正在等待模型变为 READY",
-                error=None,
+                model_name,
+                image_ref,
+                target_versions=resolved_target_versions,
+                attempts=1,
+                started_at=attempted_at,
+                last_attempt_at=attempted_at,
             )
 
     def create_model_copy_job(
@@ -1771,40 +2013,68 @@ class TritonHotLoader:
     ) -> Dict[str, Any]:
         normalized_model_name, normalized_image_ref = self._resolve_model_name_for_image(model_name, image_ref)
         callback_config = self._normalize_callback_config(callback)
-        self._assert_job_capacity()
+        with self._model_operation_lock(normalized_model_name):
+            state = self._load_state()
+            for existing_job_name, existing in state.get("jobs", {}).items():
+                if not isinstance(existing, Mapping):
+                    continue
+                if existing.get("model_name") != normalized_model_name:
+                    continue
+                if str(existing.get("status") or "").upper() not in _ACTIVE_JOB_STATUSES:
+                    continue
+                if existing.get("image") != normalized_image_ref:
+                    raise HotLoaderConflictError(
+                        f"模型 {normalized_model_name} 已有活跃 operation {existing_job_name}，"
+                        "其镜像不同；请等待当前 operation 进入终态后再提交"
+                    )
+                return {
+                    "success": True,
+                    "job_name": existing_job_name,
+                    "model_name": normalized_model_name,
+                    "image": normalized_image_ref,
+                    "status": existing.get("status"),
+                    "callback_registered": bool(existing.get("callback")),
+                    "target_versions": self._normalize_target_versions(existing.get("target_versions")),
+                    "reused": True,
+                }
 
-        job_name = self._job_name_for_model(normalized_model_name)
-        manifest = self._build_job_manifest(job_name, normalized_model_name, normalized_image_ref)
-        batch_api = self._get_batch_v1_api()
+            self._assert_job_capacity()
+            job_name = self._job_name_for_model(normalized_model_name)
+            manifest = self._build_job_manifest(job_name, normalized_model_name, normalized_image_ref)
+            batch_api = self._get_batch_v1_api()
 
-        try:
-            created = batch_api.create_namespaced_job(
+            try:
+                created = batch_api.create_namespaced_job(
+                    namespace=self.config.k8s_namespace,
+                    body=manifest,
+                )
+            except Exception as exc:
+                raise HotLoaderError(f"创建 Kubernetes Job 失败: {self._exception_text(exc)}") from exc
+
+            metadata = getattr(created, "metadata", None)
+            target_versions = self._target_versions_from_image(normalized_image_ref)
+            self._update_job_state(
+                job_name,
+                status="JOB_CREATED",
+                model_name=normalized_model_name,
+                image=normalized_image_ref,
+                callback=callback_config,
                 namespace=self.config.k8s_namespace,
-                body=manifest,
+                job_uid=getattr(metadata, "uid", None),
+                created_at=self._utc_now(),
+                target_versions=target_versions,
             )
-        except Exception as exc:
-            raise HotLoaderError(f"创建 Kubernetes Job 失败: {self._exception_text(exc)}") from exc
 
-        metadata = getattr(created, "metadata", None)
-        self._update_job_state(
-            job_name,
-            status="JOB_CREATED",
-            model_name=normalized_model_name,
-            image=normalized_image_ref,
-            callback=callback_config,
-            namespace=self.config.k8s_namespace,
-            job_uid=getattr(metadata, "uid", None),
-            created_at=self._utc_now(),
-        )
-
-        return {
-            "success": True,
-            "job_name": job_name,
-            "model_name": normalized_model_name,
-            "image": normalized_image_ref,
-            "status": "JOB_CREATED",
-            "callback_registered": bool(callback_config),
-        }
+            return {
+                "success": True,
+                "job_name": job_name,
+                "model_name": normalized_model_name,
+                "image": normalized_image_ref,
+                "status": "JOB_CREATED",
+                "callback_registered": bool(callback_config),
+                "target_versions": target_versions,
+                "reused": False,
+            }
 
     def wait_for_job_terminal_state(
         self,
@@ -2018,11 +2288,28 @@ class TritonHotLoader:
             or getattr(getattr(job, "metadata", None), "annotations", {}).get("hot-loader/image-ref")
             or ""
         )
-        logs = self._read_pod_logs(pod_name) if include_logs else cached.get("logs")
+        logs = (
+            self._read_pod_logs(pod_name)
+            if include_logs or controller_status == "COPY_SUCCEEDED"
+            else cached.get("logs")
+        )
 
         if controller_status == "COPY_SUCCEEDED" and model_name and image_ref:
+            target_versions = self._target_versions_from_copy_logs(logs)
+            if target_versions:
+                self._update_job_state(
+                    job_name,
+                    target_versions=target_versions,
+                    model_name=model_name,
+                    image=image_ref,
+                )
             try:
-                finalized = self._finalize_successful_job(job_name, model_name, image_ref)
+                finalized = self._finalize_successful_job(
+                    job_name,
+                    model_name,
+                    image_ref,
+                    target_versions=target_versions,
+                )
                 controller_status = str(finalized.get("status") or controller_status)
                 detail = str(finalized.get("detail") or detail)
             except HotLoaderError as exc:
@@ -2528,22 +2815,14 @@ class TritonHotLoader:
             with self._model_operation_lock(model_name):
                 self._unload_model(model_name, tolerate_missing=True)
                 self._wait_for_model_unloaded(model_name)
-                self._delete_model_directory(model_name)
-
-        with self._state_lock:
-            state = self._hydrate_state_aliases(self._load_state())
-            aliases = state.setdefault("aliases", {})
-            if alias not in aliases:
-                raise HotLoaderError(f"alias 不存在: {alias}")
-            del aliases[alias]
-            state["updated_at"] = self._utc_now()
-            self._save_state(state)
 
         return {
             "alias": alias,
             "image": current.get("image"),
             "models": models,
-            "updated_at": state["updated_at"],
+            "unloaded_models": models,
+            "detail": "仅卸载 Triton 运行态；Repository 文件和管理映射已保留，可直接 reload",
+            "updated_at": self._utc_now(),
         }
 
     def unload_aliases(self, aliases: Iterable[str]) -> Dict[str, Any]:
@@ -2571,36 +2850,16 @@ class TritonHotLoader:
         if not unique_models:
             raise HotLoaderError("请至少提供一个 model name")
 
-        affected_aliases = []
-
         for model_name in unique_models:
             with self._model_operation_lock(model_name):
                 self._unload_model(model_name, tolerate_missing=True)
                 self._wait_for_model_unloaded(model_name)
-                self._delete_model_directory(model_name)
-
-        with self._state_lock:
-            state = self._hydrate_state_aliases(self._load_state())
-            aliases = state.setdefault("aliases", {})
-            for alias, meta in list(aliases.items()):
-                models = [model_name for model_name in meta.get("models", []) if model_name not in unique_models]
-                if len(models) != len(meta.get("models", [])):
-                    affected_aliases.append(alias)
-                    if models:
-                        meta["models"] = models
-                        meta.pop("model_versions", None)
-                        meta.pop("active_versions", None)
-                        meta["updated_at"] = self._utc_now()
-                    else:
-                        del aliases[alias]
-
-            state["updated_at"] = self._utc_now()
-            self._save_state(state)
 
         return {
             "success": True,
-            "removed_models": unique_models,
-            "affected_aliases": sorted(affected_aliases),
+            "unloaded_models": unique_models,
+            "affected_aliases": [],
+            "detail": "仅卸载 Triton 运行态；Repository 文件和管理映射已保留，可直接 reload",
             "state": self.get_managed_state(),
         }
 

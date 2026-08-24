@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from hot_loader import (
     HotLoaderConfig,
+    HotLoaderConflictError,
     HotLoaderError,
     TritonHotLoader,
     _default_runtime_paths,
@@ -227,6 +228,26 @@ class TritonHotLoaderKubernetesJobTests(unittest.TestCase):
         with self.assertRaisesRegex(HotLoaderError, "registry 前缀"):
             self.loader.create_model_copy_job("demo_model", "registry.example.com/demo:1")
 
+    def test_create_model_copy_job_reuses_same_active_operation_and_rejects_different_image(self) -> None:
+        first = self.loader.create_model_copy_job(
+            "demo_model", "ccr.ccs.tencentyun.com/clobotics/demo:20260817"
+        )
+        reused = self.loader.create_model_copy_job(
+            "demo_model", "ccr.ccs.tencentyun.com/clobotics/demo:20260817"
+        )
+
+        self.assertFalse(first["reused"])
+        self.assertTrue(reused["reused"])
+        self.assertEqual(reused["job_name"], first["job_name"])
+        self.assertEqual(first["target_versions"], ["20260817"])
+        self.assertEqual(reused["target_versions"], ["20260817"])
+        self.assertEqual(len(self.batch_api.created_jobs), 1)
+
+        with self.assertRaises(HotLoaderConflictError):
+            self.loader.create_model_copy_job(
+                "demo_model", "ccr.ccs.tencentyun.com/clobotics/demo:20260818"
+            )
+
     def test_register_loaded_model_skips_local_repository_check_when_repository_is_job_only(self) -> None:
         remote_config = self.config.with_updates(
             model_repository=Path(self.temp_dir.name) / "controller-runtime" / "repository",
@@ -252,7 +273,7 @@ class TritonHotLoaderKubernetesJobTests(unittest.TestCase):
         self.loader._get_batch_v1_api = lambda: self.batch_api  # type: ignore[method-assign]
         self.loader._get_core_v1_api = lambda: self.core_api  # type: ignore[method-assign]
         self.loader._load_model = lambda model_name: None  # type: ignore[method-assign]
-        self.loader._model_ready_in_triton = lambda model_name: True  # type: ignore[method-assign]
+        self.loader._model_ready_in_triton = lambda model_name, **kwargs: True  # type: ignore[method-assign]
         self.loader._update_job_state(
             "demo-job",
             status="COPY_RUNNING",
@@ -281,7 +302,7 @@ class TritonHotLoaderKubernetesJobTests(unittest.TestCase):
         self.loader._get_batch_v1_api = lambda: self.batch_api  # type: ignore[method-assign]
         self.loader._get_core_v1_api = lambda: self.core_api  # type: ignore[method-assign]
         self.loader._load_model = lambda model_name: None  # type: ignore[method-assign]
-        self.loader._model_ready_in_triton = lambda model_name: True  # type: ignore[method-assign]
+        self.loader._model_ready_in_triton = lambda model_name, **kwargs: True  # type: ignore[method-assign]
         write_model_bundle(source_repository, "demo_model", ["1"])
         self.loader._update_job_state(
             "demo-job",
@@ -326,7 +347,7 @@ class TritonHotLoaderKubernetesJobTests(unittest.TestCase):
         self.loader._get_batch_v1_api = lambda: self.batch_api  # type: ignore[method-assign]
         self.loader._get_core_v1_api = lambda: self.core_api  # type: ignore[method-assign]
         self.loader._load_model = lambda model_name: None  # type: ignore[method-assign]
-        self.loader._model_ready_in_triton = lambda model_name: True  # type: ignore[method-assign]
+        self.loader._model_ready_in_triton = lambda model_name, **kwargs: True  # type: ignore[method-assign]
         write_model_bundle(source_repository, "demo_model", ["1"])
 
         payload = self.loader._finalize_successful_job(
@@ -353,7 +374,7 @@ class TritonHotLoaderKubernetesJobTests(unittest.TestCase):
         self.loader = TritonHotLoader(sync_config)
         self.loader._get_batch_v1_api = lambda: self.batch_api  # type: ignore[method-assign]
         self.loader._get_core_v1_api = lambda: self.core_api  # type: ignore[method-assign]
-        self.loader._model_ready_in_triton = lambda model_name: True  # type: ignore[method-assign]
+        self.loader._model_ready_in_triton = lambda model_name, **kwargs: True  # type: ignore[method-assign]
         write_model_bundle(source_repository, "demo_model", ["1"])
 
         load_calls = []
@@ -397,7 +418,7 @@ class TritonHotLoaderKubernetesJobTests(unittest.TestCase):
         self.assertEqual(load_calls, ["demo_model"])
         self.assertTrue(all(result["status"] == "MODEL_READY" for result in results))
 
-    def test_unload_models_deletes_local_and_source_repository_when_controller_can_access_both(self) -> None:
+    def test_unload_models_preserves_local_source_repository_and_mapping(self) -> None:
         base_dir = Path(self.temp_dir.name)
         local_repository = base_dir / "shared-volume" / "trt_models"
         source_repository = base_dir / "repository" / "trt_models"
@@ -420,11 +441,35 @@ class TritonHotLoaderKubernetesJobTests(unittest.TestCase):
         result = self.loader.unload_models(["demo_model"])
 
         self.assertTrue(result["success"])
-        self.assertFalse((local_repository / "demo_model").exists())
-        self.assertFalse((source_repository / "demo_model").exists())
+        self.assertEqual(result["unloaded_models"], ["demo_model"])
+        self.assertTrue((local_repository / "demo_model").exists())
+        self.assertTrue((source_repository / "demo_model").exists())
+        self.assertIn("demo_model", self.loader.get_managed_state()["managed_models"])
         self.assertEqual(self.batch_api.created_jobs, [])
 
-    def test_unload_models_uses_repository_cleanup_job_when_repository_is_job_only(self) -> None:
+    def test_unload_then_reload_restores_same_registered_model_without_copy_job(self) -> None:
+        write_model_bundle(self.config.model_repository, "demo_model", ["1"])
+        self.loader._register_loaded_model("demo_model", "ccr.ccs.tencentyun.com/clobotics/demo:1")
+        states = iter(
+            [
+                [{"name": "demo_model", "version": "1", "state": "READY", "reason": ""}],
+                [{"name": "demo_model", "version": "1", "state": "UNAVAILABLE", "reason": ""}],
+            ]
+        )
+        self.loader.list_repository_models = lambda safe=False: next(states)  # type: ignore[method-assign]
+        calls = []
+        self.loader._unload_model = lambda model_name, tolerate_missing=True: calls.append(("unload", model_name))  # type: ignore[method-assign]
+
+        self.loader.unload_models(["demo_model"])
+        self.loader._load_model = lambda model_name: calls.append(("load", model_name))  # type: ignore[method-assign]
+        result = self.loader.reload_models(["demo_model"])
+
+        self.assertTrue((self.config.model_repository / "demo_model").exists())
+        self.assertIn("demo_model", self.loader.get_managed_state()["managed_models"])
+        self.assertEqual(result["reloaded_models"], ["demo_model"])
+        self.assertEqual(calls, [("unload", "demo_model"), ("load", "demo_model")])
+
+    def test_unload_models_does_not_create_repository_cleanup_job_when_repository_is_job_only(self) -> None:
         remote_config = self.config.with_updates(
             model_repository=Path(self.temp_dir.name) / "controller-runtime" / "repository",
             repository_maintenance_image="ccr.ccs.tencentyun.com/clobotics/triton-hot-loader:helper",
@@ -441,20 +486,11 @@ class TritonHotLoaderKubernetesJobTests(unittest.TestCase):
         result = self.loader.unload_models(["demo_model"])
 
         self.assertTrue(result["success"])
-        namespace, manifest = self.batch_api.created_jobs[0]
-        self.assertEqual(namespace, "default")
-        container = manifest["spec"]["template"]["spec"]["containers"][0]
-        self.assertEqual(container["image"], "ccr.ccs.tencentyun.com/clobotics/triton-hot-loader:helper")
-        self.assertEqual(container["env"][1]["value"], "/repository/trt_models")
-        self.assertIn('rm -rf "${TARGET_DIR}"', container["args"][0])
-        self.assertEqual(container["volumeMounts"][0]["mountPath"], "/repository")
-        self.assertEqual(
-            manifest["spec"]["template"]["spec"]["volumes"][0]["persistentVolumeClaim"]["claimName"],
-            "triton-repository-pvc",
-        )
-        self.assertEqual(result["removed_models"], ["demo_model"])
+        self.assertEqual(result["unloaded_models"], ["demo_model"])
+        self.assertEqual(self.batch_api.created_jobs, [])
+        self.assertIn("demo_model", self.loader.get_managed_state()["managed_models"])
 
-    def test_unload_models_waits_for_triton_to_leave_ready_before_deleting_repository(self) -> None:
+    def test_unload_models_waits_for_triton_to_leave_ready_without_deleting_repository(self) -> None:
         call_order = []
         repository_states = iter(
             [
@@ -464,15 +500,14 @@ class TritonHotLoaderKubernetesJobTests(unittest.TestCase):
         )
 
         self.loader._unload_model = lambda model_name, tolerate_missing=True: call_order.append(("unload", model_name))  # type: ignore[method-assign]
-        self.loader._delete_model_directory = lambda model_name: call_order.append(("delete", model_name))  # type: ignore[method-assign]
         self.loader.list_repository_models = lambda safe=False: next(repository_states)  # type: ignore[method-assign]
 
         result = self.loader.unload_models(["demo_model"])
 
         self.assertTrue(result["success"])
-        self.assertEqual(call_order, [("unload", "demo_model"), ("delete", "demo_model")])
+        self.assertEqual(call_order, [("unload", "demo_model")])
 
-    def test_unload_alias_waits_for_triton_to_leave_ready_before_deleting_repository(self) -> None:
+    def test_unload_alias_waits_for_triton_to_leave_ready_without_deleting_repository(self) -> None:
         write_model_bundle(self.config.model_repository, "demo_model", ["1"])
         self.loader._register_loaded_model("demo_model", "ccr.ccs.tencentyun.com/clobotics/demo:old")
 
@@ -485,13 +520,13 @@ class TritonHotLoaderKubernetesJobTests(unittest.TestCase):
         )
 
         self.loader._unload_model = lambda model_name, tolerate_missing=True: call_order.append(("unload", model_name))  # type: ignore[method-assign]
-        self.loader._delete_model_directory = lambda model_name: call_order.append(("delete", model_name))  # type: ignore[method-assign]
         self.loader.list_repository_models = lambda safe=False: next(repository_states)  # type: ignore[method-assign]
 
         result = self.loader.unload_alias("model_demo_model")
 
         self.assertEqual(result["models"], ["demo_model"])
-        self.assertEqual(call_order, [("unload", "demo_model"), ("delete", "demo_model")])
+        self.assertEqual(call_order, [("unload", "demo_model")])
+        self.assertIn("demo_model", self.loader.get_managed_state()["managed_models"])
 
     def test_assert_job_capacity_skips_limit_when_disabled(self) -> None:
         self.loader.config = self.loader.config.with_updates(max_concurrent_jobs=0)
@@ -713,7 +748,78 @@ class TritonHotLoaderKubernetesJobTests(unittest.TestCase):
         self.assertTrue(any(item["image"] == "ccr.ccs.tencentyun.com/clobotics/demo:2" for item in state["managed_images"]))
         self.assertEqual(result["alias"], "model_demo_model")
 
-    def test_get_job_status_rolls_back_managed_state_when_triton_load_fails(self) -> None:
+    def test_copy_job_accepts_ready_target_version_after_unavailable_old_version(self) -> None:
+        write_model_bundle(self.config.model_repository, "demo_model", ["20260817"])
+        self.batch_api.job_to_read = SimpleNamespace(
+            metadata=SimpleNamespace(
+                annotations={
+                    "hot-loader/model-name": "demo_model",
+                    "hot-loader/image-ref": "ccr.ccs.tencentyun.com/clobotics/demo:20260817",
+                }
+            ),
+            status=SimpleNamespace(active=0, failed=0, succeeded=1),
+        )
+        self.core_api.pods = [SimpleNamespace(metadata=SimpleNamespace(name="demo-pod"), status=SimpleNamespace(phase="Succeeded"))]
+        self.core_api.logs = {"demo-pod": "model copy done target_versions=20260817"}
+        load_calls = []
+        self.loader._load_model = lambda model_name: load_calls.append(model_name)  # type: ignore[method-assign]
+        self.loader.list_repository_models = lambda safe=True: [  # type: ignore[method-assign]
+            {"name": "demo_model", "version": "20260812", "state": "UNAVAILABLE", "reason": "unloaded"},
+            {"name": "demo_model", "version": "20260817", "state": "READY", "reason": ""},
+        ]
+
+        result = self.loader.get_job_status("model-copy-demo")
+
+        self.assertEqual(result["status"], "MODEL_READY")
+        self.assertEqual(result["target_versions"], ["20260817"])
+        self.assertEqual(load_calls, ["demo_model"])
+
+    def test_terminal_failed_job_is_not_changed_by_later_ready_version(self) -> None:
+        self.loader._update_job_state(
+            "failed-job",
+            status="TRITON_RELOAD_FAILED",
+            model_name="demo_model",
+            image="ccr.ccs.tencentyun.com/clobotics/demo:20260817",
+            target_versions=["20260817"],
+            detail="target version never became ready",
+        )
+        self.loader.list_repository_models = lambda safe=True: [  # type: ignore[method-assign]
+            {"name": "demo_model", "version": "20260812", "state": "READY", "reason": ""},
+        ]
+
+        result = self.loader._finalize_successful_job(
+            "failed-job", "demo_model", "ccr.ccs.tencentyun.com/clobotics/demo:20260817"
+        )
+
+        self.assertEqual(result["status"], "TRITON_RELOAD_FAILED")
+        self.assertEqual(result["detail"], "target version never became ready")
+
+    def test_reload_stops_at_configured_attempt_limit_and_preserves_error(self) -> None:
+        self.loader.config = self.loader.config.with_updates(triton_reload_max_attempts=2)
+        self.loader._update_job_state(
+            "model-copy-demo",
+            status="TRITON_RELOAD_RUNNING",
+            model_name="demo_model",
+            image="ccr.ccs.tencentyun.com/clobotics/demo:20260817",
+            target_versions=["20260817"],
+            triton_reload_attempts=1,
+            triton_reload_started_at=self.loader._utc_now(),
+            triton_reload_next_attempt_at="2000-01-01T00:00:00+00:00",
+        )
+        self.loader.list_repository_models = lambda safe=True: [  # type: ignore[method-assign]
+            {"name": "demo_model", "version": "20260817", "state": "UNAVAILABLE", "reason": ""},
+        ]
+        self.loader._load_model = lambda model_name: (_ for _ in ()).throw(HotLoaderError("Triton unavailable"))  # type: ignore[method-assign]
+
+        result = self.loader._finalize_successful_job(
+            "model-copy-demo", "demo_model", "ccr.ccs.tencentyun.com/clobotics/demo:20260817"
+        )
+
+        self.assertEqual(result["status"], "TRITON_RELOAD_FAILED")
+        self.assertEqual(result["triton_reload_next_attempt_at"], None)
+        self.assertIn("Triton unavailable", result["error"])
+
+    def test_get_job_status_schedules_retry_when_initial_triton_load_fails(self) -> None:
         write_model_bundle(self.config.model_repository, "demo_model", ["1"])
         self.loader._register_loaded_model("demo_model", "ccr.ccs.tencentyun.com/clobotics/demo:old")
         write_model_bundle(self.config.model_repository, "demo_model", ["2"])
@@ -736,9 +842,11 @@ class TritonHotLoaderKubernetesJobTests(unittest.TestCase):
         result = self.loader.get_job_status("model-copy-demo")
         state = self.loader.get_managed_state()
 
-        self.assertEqual(result["status"], "TRITON_RELOAD_FAILED")
-        self.assertEqual(state["managed_images"][0]["image"], "ccr.ccs.tencentyun.com/clobotics/demo:old")
+        self.assertEqual(result["status"], "TRITON_RELOAD_RUNNING")
+        self.assertEqual(state["managed_images"][0]["image"], "ccr.ccs.tencentyun.com/clobotics/demo:new")
         self.assertEqual(state["managed_images"][0]["models"], ["demo_model"])
+        self.assertIn("explicit load failed", result["error"])
+        self.assertIsNotNone(result["triton_reload_next_attempt_at"])
 
     def test_get_job_status_keeps_reloading_until_triton_reports_ready(self) -> None:
         write_model_bundle(self.config.model_repository, "demo_model", ["2"])
@@ -765,10 +873,14 @@ class TritonHotLoaderKubernetesJobTests(unittest.TestCase):
         self.loader.list_repository_models = lambda safe=True: next(repository_states)  # type: ignore[method-assign]
 
         first = self.loader.get_job_status("model-copy-demo")
+        self.loader._update_job_state(
+            "model-copy-demo",
+            triton_reload_next_attempt_at="2000-01-01T00:00:00+00:00",
+        )
         second = self.loader.get_job_status("model-copy-demo")
 
         self.assertEqual(first["status"], "TRITON_RELOAD_RUNNING")
-        self.assertIn("等待模型变为 READY", first["detail"])
+        self.assertIn("将在", first["detail"])
         self.assertEqual(second["status"], "MODEL_READY")
         self.assertEqual(second["triton_reload_attempts"], 2)
         self.assertEqual(load_calls, ["demo_model", "demo_model"])

@@ -105,6 +105,30 @@ def add_common_runtime_args(parser: argparse.ArgumentParser) -> None:
         help=f"允许同时运行的 Job 上限，默认: {defaults.max_concurrent_jobs}（0 表示不限制）",
     )
     parser.add_argument(
+        "--triton-reload-max-attempts",
+        type=int,
+        default=defaults.triton_reload_max_attempts,
+        help=f"Triton reload 最大尝试次数，默认: {defaults.triton_reload_max_attempts}",
+    )
+    parser.add_argument(
+        "--triton-reload-retry-base-seconds",
+        type=float,
+        default=defaults.triton_reload_retry_base_seconds,
+        help=f"Triton reload 指数退避起始秒数，默认: {defaults.triton_reload_retry_base_seconds}",
+    )
+    parser.add_argument(
+        "--triton-reload-retry-max-seconds",
+        type=float,
+        default=defaults.triton_reload_retry_max_seconds,
+        help=f"Triton reload 指数退避上限秒数，默认: {defaults.triton_reload_retry_max_seconds}",
+    )
+    parser.add_argument(
+        "--triton-reload-timeout-seconds",
+        type=float,
+        default=defaults.triton_reload_timeout_seconds,
+        help=f"等待 Triton 目标版本 READY 的总超时秒数，默认: {defaults.triton_reload_timeout_seconds}",
+    )
+    parser.add_argument(
         "--repository-maintenance-image",
         default=defaults.repository_maintenance_image,
         help="Job-only repository 模式下用于清理 PVC 模型目录的辅助镜像",
@@ -187,6 +211,10 @@ def build_config_from_args(args: argparse.Namespace) -> HotLoaderConfig:
         model_copy_cpu_limit=args.model_copy_cpu_limit,
         model_copy_memory_limit=args.model_copy_memory_limit,
         max_concurrent_jobs=args.max_concurrent_jobs,
+        triton_reload_max_attempts=args.triton_reload_max_attempts,
+        triton_reload_retry_base_seconds=args.triton_reload_retry_base_seconds,
+        triton_reload_retry_max_seconds=args.triton_reload_retry_max_seconds,
+        triton_reload_timeout_seconds=args.triton_reload_timeout_seconds,
         repository_maintenance_image=args.repository_maintenance_image,
         request_timeout=args.request_timeout,
     )

@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from hot_loader import HotLoaderConfig, TritonHotLoader
+from hot_loader import HotLoaderConfig, HotLoaderConflictError, TritonHotLoader
 from server import (
     TRITON_METRICS_PORT_OVERRIDE_HEADER,
     TRITON_URL_OVERRIDE_HEADER,
@@ -172,6 +172,20 @@ class ServerRoutesTests(unittest.TestCase):
         self.assertIsNone(captured["callback"])
         self.assertEqual(response.json()["status"], "JOB_CREATED")
 
+    def test_api_models_load_route_returns_conflict_for_different_active_image(self) -> None:
+        with patch.object(
+            TritonHotLoader,
+            "create_model_copy_job",
+            side_effect=HotLoaderConflictError("demo_model already has an active operation"),
+        ):
+            response = self.client.post(
+                "/api/models/load",
+                json={"image": "ccr.ccs.tencentyun.com/clobotics/demo:20260818"},
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertFalse(response.json()["success"])
+
     def test_api_models_load_route_registers_callback(self) -> None:
         captured = {}
 
@@ -280,7 +294,7 @@ class ServerRoutesTests(unittest.TestCase):
             captured["model_names"] = list(model_names)
             return {
                 "success": True,
-                "removed_models": list(model_names),
+                "unloaded_models": list(model_names),
                 "affected_aliases": [],
                 "state": {"managed_model_count": 0},
             }
@@ -299,7 +313,7 @@ class ServerRoutesTests(unittest.TestCase):
         self.assertEqual(captured["model_names"], ["demo_model_a", "demo_model_b"])
         self.assertTrue(response.json()["success"])
         self.assertEqual(
-            response.json()["model_result"]["removed_models"],
+            response.json()["model_result"]["unloaded_models"],
             ["demo_model_a", "demo_model_b"],
         )
 
