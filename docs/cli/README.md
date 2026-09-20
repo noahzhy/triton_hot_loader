@@ -135,7 +135,7 @@ python3 cli.py unload --aliases model_demo_model
 
 说明：
 
-- 同名模型现在总是直接替换，不再支持 `model_name@version` 级别的版本卸载。
+- `unload --models` 仍按整个 Triton 模型卸载；同模型多个版本会一起停止。
 - `unload` 仅改变 Triton 运行态，不删除 PVC 模型目录或 controller 管理映射；同一模型可直接用 `reload` 恢复。
 
 ### `reload`
@@ -146,11 +146,11 @@ python3 cli.py unload --aliases model_demo_model
 python3 cli.py reload demo_model another_model
 ```
 
-### 同名模型替换
+### 同名模型多版本加载
 
-当新的加载请求解析出与现有模型相同的 `model_name` 时，controller 会直接替换仓库中的同名模型目录，并把状态里的当前镜像更新为最新值；不会再保留同名模型的历史版本记录。
+当新的加载请求解析出与现有模型相同的 `model_name` 时，controller 会保留仓库中已有的数字版本目录，并原子合并镜像新交付的版本目录。随后会将 `config.pbtxt` 的 `version_policy` 更新为包含全部发现版本的 `specific` 策略，因此 Triton 会同时加载这些版本。
 
-当前实现不会长时间直接覆盖线上目录，而是先复制到挂载卷内的 `.staging/`，再切换到目标目录，避免 Triton 在替换窗口读到半成品模型目录。
+当前实现不会长时间直接覆盖线上目录，而是先在挂载卷内的 `.staging/` 合并，再切换到目标目录，避免 Triton 在切换窗口读到半成品模型目录。管理状态中的 `managed_model_versions` 会列出已管理模型的版本。
 
 ## 运行前提
 

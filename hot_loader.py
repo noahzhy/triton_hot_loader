@@ -1143,6 +1143,10 @@ class TritonHotLoader:
                 'rm -rf "${STAGING_DIR}" "${BACKUP_DIR}"',
                 'mkdir -p "$(dirname "${STAGING_DIR}")"',
                 'mkdir -p "${STAGING_DIR}"',
+                # Preserve previously copied numeric version directories.  A model image
+                # normally contains only the version it delivers, so replacing TARGET_DIR
+                # here made a later version silently discard earlier ones.
+                'if [ -d "${TARGET_DIR}" ]; then cp -R "${TARGET_DIR}/." "${STAGING_DIR}/"; fi',
                 'cp -R "${COPY_SOURCE}/." "${STAGING_DIR}/"',
                 'if [ -d "${TARGET_DIR}" ]; then mv "${TARGET_DIR}" "${BACKUP_DIR}"; fi',
                 'if mv "${STAGING_DIR}" "${TARGET_DIR}"; then',
@@ -1159,6 +1163,16 @@ class TritonHotLoader:
                 '  TARGET_VERSIONS="${TARGET_VERSIONS}${TARGET_VERSIONS:+,}${VERSION}"',
                 'done',
                 'if [ -z "${TARGET_VERSIONS}" ]; then echo "no numeric Triton model versions found"; exit 1; fi',
+                # Source images may carry a latest/specific policy for just the
+                # delivered version.  Normalize it on the PVC too, because in
+                # job-only mode the controller cannot edit this config itself.
+                'VERSION_LIST="$(printf "%s" "${TARGET_VERSIONS}" | sed "s/,/, /g")"',
+                'CONFIG_PATH="${TARGET_DIR}/config.pbtxt"',
+                'if [ -f "${CONFIG_PATH}" ]; then',
+                "  awk 'function braces(line, opens, closes) { opens=gsub(/\\{/, \"{\", line); closes=gsub(/\\}/, \"}\", line); return opens - closes } /^[[:space:]]*version_policy[[:space:]]*:/ { skipping=1; depth=braces($0); if (depth <= 0) skipping=0; next } skipping { depth += braces($0); if (depth <= 0) skipping=0; next } { print }' \"${CONFIG_PATH}\" > \"${CONFIG_PATH}.hot-loader\"",
+                '  printf "\\nversion_policy: {\\n  specific {\\n    versions: [ %s ]\\n  }\\n}\\n" "${VERSION_LIST}" >> "${CONFIG_PATH}.hot-loader"',
+                '  mv "${CONFIG_PATH}.hot-loader" "${CONFIG_PATH}"',
+                'fi',
                 'echo "model copy done target_versions=${TARGET_VERSIONS}"',
             ]
         )
@@ -1526,9 +1540,15 @@ class TritonHotLoader:
             }
 
             self._drop_model_from_aliases(aliases, model_name)
+            model_versions: Dict[str, List[str]] = {}
+            if (self.config.model_repository / model_name).is_dir():
+                model_versions[model_name] = self._discover_model_versions(
+                    self.config.model_repository / model_name
+                )
             aliases[alias] = {
                 "image": image_ref,
                 "models": [model_name],
+                "model_versions": model_versions,
                 "updated_at": self._utc_now(),
             }
             state["updated_at"] = self._utc_now()
@@ -1956,6 +1976,12 @@ class TritonHotLoader:
 
             if self._uses_repository_sync_mode():
                 self._sync_model_from_job_repository(model_name)
+
+            # A source image normally delivers only one version.  Ensure its
+            # config does not hide versions already present in the repository.
+            if self._can_verify_local_model_repository():
+                model_dir = self.config.model_repository / model_name
+                self._write_version_policy(model_dir, self._discover_model_versions(model_dir))
 
             registration = self._register_loaded_model(model_name, image_ref)
             self._update_job_state(
@@ -2423,10 +2449,16 @@ class TritonHotLoader:
             else:
                 updated_text = before or after
 
-    def _write_active_version_policy(self, model_dir: Path, active_version: str) -> bool:
+    def _write_version_policy(self, model_dir: Path, versions: Sequence[str]) -> bool:
         config_path = model_dir / "config.pbtxt"
         if not config_path.exists():
             return False
+
+        normalized_versions = self._sort_versions(
+            version for version in versions if _TRITON_VERSION_DIR_PATTERN.match(version)
+        )
+        if not normalized_versions:
+            raise HotLoaderError("无法为无版本模型写入 Triton version_policy")
 
         try:
             config_text = config_path.read_text(encoding="utf-8")
@@ -2438,7 +2470,7 @@ class TritonHotLoader:
             [
                 "version_policy: {",
                 "  specific {",
-                f"    versions: [ {int(active_version)} ]",
+                f"    versions: [ {', '.join(str(int(version)) for version in normalized_versions)} ]",
                 "  }",
                 "}",
             ]
@@ -2450,6 +2482,10 @@ class TritonHotLoader:
         except OSError as exc:
             raise HotLoaderError(f"写入模型配置失败: {config_path} ({exc})") from exc
         return True
+
+    def _write_active_version_policy(self, model_dir: Path, active_version: str) -> bool:
+        """Backward-compatible wrapper for callers that select one version."""
+        return self._write_version_policy(model_dir, [active_version])
 
     @staticmethod
     def _extract_specific_version_policy(config_text: str) -> List[str]:
@@ -2600,7 +2636,12 @@ class TritonHotLoader:
         hydrated = dict(meta)
         models = [model_name for model_name in hydrated.get("models", []) if isinstance(model_name, str)]
         hydrated["models"] = models
-        hydrated.pop("model_versions", None)
+        raw_model_versions = hydrated.get("model_versions", {})
+        hydrated["model_versions"] = {
+            model_name: self._sort_versions(str(version) for version in versions if str(version).isdigit())
+            for model_name, versions in raw_model_versions.items()
+            if model_name in models and isinstance(versions, Sequence) and not isinstance(versions, (str, bytes))
+        } if isinstance(raw_model_versions, Mapping) else {}
         hydrated.pop("active_versions", None)
         return hydrated
 
@@ -2635,6 +2676,11 @@ class TritonHotLoader:
                 for model_name in meta.get("models", [])
             }
         )
+        managed_model_versions = {
+            model_name: versions
+            for meta in aliases.values()
+            for model_name, versions in meta.get("model_versions", {}).items()
+        }
         return {
             "config": self.config.to_dict(),
             "updated_at": state.get("updated_at"),
@@ -2644,6 +2690,7 @@ class TritonHotLoader:
             "managed_image_count": len(managed_images),
             "managed_model_count": len(managed_models),
             "managed_models": managed_models,
+            "managed_model_versions": managed_model_versions,
             "jobs": jobs,
             "job_count": len(jobs),
             "active_jobs": sorted(

@@ -87,7 +87,7 @@ JOB_TOLERATIONS_JSON=[{"key":"gpu","operator":"Exists","effect":"NoSchedule"}]
 - Controller 最好与 Triton 共享同一个 Repository PVC。
 - 现有项目里的模型初始化镜像默认把模型放在 `/trt_models/<model_name>/...`，controller 会优先按这个结构复制；如果镜像里直接是单模型内容目录，也会回退兼容。
 - 生产环境建议把 `HOT_TRITON_STATE_FILE` 和 `HOT_TRITON_STAGING_ROOT` 放在 `trt_models` 目录外层，避免 `.hot_loader/`、`.staging/` 进入 Triton model store。
-- 同名模型替换时，model-copy Job 会先把新模型复制到挂载卷里的 `.staging/`，再切换到目标目录，避免长时间直接覆盖线上模型目录。
+- 同名模型的新版本会先与仓库中已有数字版本目录合并到挂载卷里的 `.staging/`，再原子切换到目标目录；controller 会把 `config.pbtxt` 更新为包含所有发现版本的 `specific` 策略，使 Triton 同时加载它们。
 - 当 `MODEL_TARGET_PATH` 是 `/repository/trt_models` 这种 PVC 子目录时，model-copy Job 会把 PVC 挂到它的父目录 `/repository`，然后再复制到 `${MODEL_TARGET_PATH}/${MODEL_NAME}`。
 - `JOB_TTL_SECONDS_AFTER_FINISHED=0` 表示 Job 一旦进入完成态就立即交给 TTL controller 删除；controller 自己的状态文件仍会保留最近一次结果摘要。
 - 即使复制 Job 已被 TTL 清理，只要模型目录已经落盘，controller 仍会继续自动推进后续的 Triton load/reload 状态机。
@@ -178,7 +178,7 @@ POST /api/models/load-batch
 - 提取规则会去掉 tag 末尾常见的日期/时间发布后缀，例如 `unit_empty_space_uspg_yolov8-20260430 -> unit_empty_space_uspg_yolov8`。
 - 对以 `-YYYYMMDD` 结尾的镜像 tag，controller 会预先记录该版本为本次 operation 的目标版本；model-copy Job 完成后会以实际复制出的数字版本目录覆盖确认。
 - tag 中的 `-`、`.` 会统一规整成 `_`，例如 `model-a -> model_a`。
-- 如果新请求解析出的 `model_name` 与当前已加载模型同名，controller 会直接替换旧模型，不保留同名历史版本。
+- 如果新请求解析出的 `model_name` 与当前已加载模型同名，controller 会保留旧数字版本目录并加载新版本；状态中的 `managed_model_versions` 可查看当前版本集合。
 - `callback` 是可选对象；当前只支持 `terminal` 事件，也就是 `MODEL_READY`、`COPY_FAILED`、`TRITON_RELOAD_FAILED` 这三类终态回调。
 - `callback.url` 必须是你自己的业务回调接收地址，不应该填写 hot-loader 自己的 `http://10.2.24.10:30890/...`。
 - `callback.token` 如果提供，controller 会在回调请求头里附带 `X-Hot-Loader-Signature: sha256=<hmac>`，签名内容是 `timestamp + "." + raw_body`。

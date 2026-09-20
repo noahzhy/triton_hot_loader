@@ -135,6 +135,7 @@ class TritonHotLoaderKubernetesJobTests(unittest.TestCase):
         self.assertEqual(container["env"][2]["value"], "/repository/trt_models")
         self.assertEqual(container["env"][3]["value"], _derive_job_staging_root(self.config.model_target_path))
         self.assertIn('SOURCE_DIR="${MODEL_SOURCE_PATH%/}/${MODEL_NAME}"', container["args"][0])
+        self.assertIn('if [ -d "${TARGET_DIR}" ]; then cp -R "${TARGET_DIR}/." "${STAGING_DIR}/"; fi', container["args"][0])
         self.assertIn('cp -R "${COPY_SOURCE}/." "${STAGING_DIR}/"', container["args"][0])
         self.assertIn('STAGING_DIR="${STAGING_ROOT%/}/${MODEL_NAME}/${JOB_NAME}"', container["args"][0])
         self.assertIn('if mv "${STAGING_DIR}" "${TARGET_DIR}"; then', container["args"][0])
@@ -955,6 +956,7 @@ class TritonHotLoaderKubernetesJobTests(unittest.TestCase):
         self.assertEqual(first["alias"], "model_demo_model")
         self.assertEqual(second["alias"], "model_demo_model")
         self.assertEqual(state["managed_model_count"], 1)
+        self.assertEqual(state["managed_model_versions"], {"demo_model": ["1"]})
         self.assertEqual(state["managed_images"], [
             {
                 "id": "model_demo_model",
@@ -963,12 +965,19 @@ class TritonHotLoaderKubernetesJobTests(unittest.TestCase):
                 "updated_at": state["managed_images"][0]["updated_at"],
             }
         ])
-        self.assertNotIn("managed_model_versions", state)
         self.assertNotIn("managed_active_versions", state)
 
     def test_unload_model_versions_is_rejected_after_version_management_removed(self) -> None:
         with self.assertRaisesRegex(HotLoaderError, "取消版本管理"):
             self.loader.unload_model_versions(["demo_model@3"])
+
+    def test_version_policy_keeps_all_versions_of_one_model_loaded(self) -> None:
+        model_dir = write_model_bundle(self.config.model_repository, "demo_model", ["1", "2"])
+
+        self.assertTrue(self.loader._write_version_policy(model_dir, ["2", "1"]))
+
+        config_text = (model_dir / "config.pbtxt").read_text(encoding="utf-8")
+        self.assertIn("versions: [ 1, 2 ]", config_text)
 
 
 class HotLoaderDefaultRuntimePathTests(unittest.TestCase):
