@@ -5,7 +5,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Triton Hot Loader</title>
-    <link rel="stylesheet" href="/static/style.css?v=20260609-collapsible-panels">
+    <link rel="stylesheet" href="/static/style.css?v=multi-instance-1">
 </head>
 
 <body>
@@ -27,6 +27,12 @@
         </header>
 
         <main class="page-flow">
+            <section class="panel instance-bar" aria-label="当前 Triton 实例">
+                <label for="instance-select">当前实例</label>
+                <select id="instance-select" class="endpoint-input" disabled><option>正在读取实例…</option></select>
+                <span id="instance-target" class="mono" aria-live="polite"></span>
+                <a href="#instance-management">管理实例</a>
+            </section>
             <section class="hero-stage" id="overview">
                 <div class="hero-copy">
                     <span class="hero-eyebrow">Triton Hot Loader</span>
@@ -134,23 +140,29 @@
                         </div>
                     </section>
 
-                    <section class="panel composer-panel">
+                    <section class="panel composer-panel" id="instance-management">
                         <div class="section-heading section-heading-compact">
                             <div>
-                                <h2>Endpoint 覆盖</h2>
+                                <h2>管理 Triton 实例</h2>
+                                <p>各实例共用模型文件，加载与卸载只作用于当前实例。</p>
                             </div>
                         </div>
                         <label class="endpoint-field">
-                            <span class="filter-label">Triton URL</span>
-                            <input id="triton-url-input" class="endpoint-input mono" type="text" placeholder="http://127.0.0.1:8000">
+                            <span class="filter-label">实例名称</span>
+                            <input id="instance-name-input" class="endpoint-input" type="text" maxlength="120" placeholder="例如 GPU Server A">
                         </label>
                         <label class="endpoint-field">
-                            <span class="filter-label">Metrics 端口</span>
-                            <input id="metrics-port-input" class="endpoint-input mono" type="number" placeholder="8002">
+                            <span class="filter-label">Triton IP / HTTP 地址</span>
+                            <input id="triton-url-input" class="endpoint-input mono" type="text" placeholder="10.0.0.8 或 http://10.0.0.8:8000">
+                        </label>
+                        <label class="endpoint-field">
+                            <span class="filter-label">Metrics 地址（可选，默认同 IP:8002）</span>
+                            <input id="metrics-url-input" class="endpoint-input mono" type="text" placeholder="http://10.0.0.8:8002/metrics">
                         </label>
                         <div class="button-group">
-                            <button id="save-triton-url-btn" class="ghost" type="button">保存</button>
-                            <button id="reset-triton-url-btn" class="ghost" type="button">恢复默认</button>
+                            <button id="add-instance-btn" class="primary" type="button">添加为新实例</button>
+                            <button id="save-instance-btn" class="ghost" type="button">保存当前实例</button>
+                            <button id="delete-instance-btn" class="danger" type="button">删除当前实例</button>
                         </div>
                     </section>
                 </aside>
@@ -289,7 +301,7 @@
         </main>
     </div>
 
-    <script src="/static/app.js?v=20260609-collapsible-panels"></script>
+    <script src="/static/app.js?v=multi-instance-1"></script>
 </body>
 
 </html>

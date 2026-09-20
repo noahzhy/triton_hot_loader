@@ -25,7 +25,7 @@
   - controller 会从镜像 tag 自动提取
   - 常见发布后缀如 `-20260430` 会被去掉
   - `-` 和 `.` 会被归一化成 `_`
-- 如果新请求解析出的模型名与现有模型同名，会直接替换，不保留同名历史版本
+- 同名模型保留不同数字版本目录，共用版本策略
 - 应用级错误返回 HTTP 400，格式通常为：
 
 ```json
@@ -35,9 +35,10 @@
 }
 ```
 
-- 可以通过请求头按请求覆盖运行时目标：
-  - `x-hot-triton-url`
-  - `x-hot-triton-metrics-port`
+- 使用 `x-hot-triton-instance-id` 选择已登记实例，缺省为 `default`；通过 `/api/instances` GET/POST 和 `/api/instances/{id}` PUT/DELETE 管理持久化列表。
+- 旧 `x-hot-triton-url` / `x-hot-triton-metrics-port` 仅匹配已登记地址，不能与实例 ID 混用；未知地址返回 400。
+- 实例共享模型文件与镜像元数据，Job 和后台重试按实例隔离。回调增加 `instance_id`、`triton_url`。同名模型跨实例活跃加载冲突返回 409。
+- 有活跃 Job 或未投递回调时禁止更改实例地址、删除实例；默认实例不可删除。完整契约见根目录 README 的“多 Triton 实例”。
 
 ## 主要 API
 
@@ -221,7 +222,7 @@ curl -X POST "${BASE_URL}/api/models/unload-batch" \
   }'
 ```
 
-按请求覆盖 Triton 目标：
+选择已登记的 Triton 目标（旧 header 兼容；须先通过实例 API 登记下述地址）：
 
 ```bash
 curl -X GET "${BASE_URL}/api/status" \
@@ -423,7 +424,7 @@ curl -X POST "${BASE_URL}/api/models/load" \
   }'
 ```
 
-按请求覆盖 Triton 地址：
+选择已登记的 Triton 地址（须先登记下述地址）：
 
 ```bash
 curl -X GET "${BASE_URL}/api/status" \

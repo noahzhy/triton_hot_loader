@@ -47,6 +47,7 @@ a {
 
 button,
 input,
+select,
 textarea {
     font: inherit;
     min-width: 0;
@@ -515,6 +516,28 @@ button.is-pending::after {
     gap: 8px;
     margin-bottom: 14px;
     min-width: 0;
+}
+
+.instance-bar {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px;
+    padding: 18px 24px;
+}
+
+.instance-bar select {
+    width: min(100%, 320px);
+}
+
+#instance-target {
+    overflow-wrap: anywhere;
+    color: var(--text-muted);
+}
+
+.instance-bar a {
+    margin-left: auto;
+    text-decoration: underline;
 }
 
 .filter-label {

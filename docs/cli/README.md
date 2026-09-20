@@ -140,6 +140,8 @@ python3 cli.py unload --aliases model_demo_model
 
 ### `reload`
 
+多实例服务登记后，CLI 使用同一个 `--state-file`，通过 `--instance-id` 选择实例，例如 `python3 cli.py reload --instance-id <ID> demo_model`。未指定时使用已登记的默认实例；`--triton-url` 用于首次登记默认地址，已有登记通过 Web/API 修改。
+
 重载一个或多个模型：
 
 ```bash

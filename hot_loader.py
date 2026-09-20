@@ -482,12 +482,139 @@ class HotLoaderConfig:
 class TritonHotLoader:
     """Manage model bundles and load or unload them through Triton APIs."""
 
-    def __init__(self, config: HotLoaderConfig | None = None) -> None:
+    def __init__(self, config: HotLoaderConfig | None = None, *, instance_id: str = "default") -> None:
         self.config = config or HotLoaderConfig.default()
+        self.instance_id = instance_id
         self._state_lock = _state_lock_for(self.config.state_file)
         self._batch_v1_api: Any | None = None
         self._core_v1_api: Any | None = None
         self._ensure_runtime_dirs()
+        self._ensure_instances()
+
+    @staticmethod
+    def normalize_endpoint(value: str, *, metrics: bool = False) -> str:
+        candidate = value.strip()
+        if not candidate:
+            raise HotLoaderError("Triton 地址不能为空")
+        if "://" not in candidate:
+            # Bare IPv6 addresses need brackets before adding a port.
+            if candidate.count(":") > 1 and not candidate.startswith("["):
+                candidate = f"[{candidate}]"
+            candidate = f"http://{candidate}"
+        try:
+            parts = urlsplit(candidate)
+            port = parts.port if parts.port is not None else (8002 if metrics else 8000)
+            if (parts.scheme not in {"http", "https"} or not parts.hostname
+                    or parts.username or parts.password or parts.query or parts.fragment
+                    or any(char.isspace() for char in candidate) or not 1 <= port <= 65535
+                    or parts.path not in ({"", "/", "/metrics"} if metrics else {"", "/"})):
+                raise ValueError()
+            host = parts.hostname.lower()
+            if ":" not in host and not re.fullmatch(r"[a-z0-9_.-]+", host):
+                raise ValueError()
+            if ":" in host:
+                host = f"[{host}]"
+            return f"{parts.scheme}://{host}:{port}" + ("/metrics" if metrics else "")
+        except ValueError as exc:
+            raise HotLoaderError("地址必须是有效的 IP/主机名或 HTTP(S) 地址，端口为 1–65535") from exc
+
+    def _ensure_instances(self) -> None:
+        with self._state_lock:
+            state = self._load_state()
+            changed = False
+            if "instances" not in state:
+                state["instances"] = {"default": {
+                    "id": "default", "name": "默认 Triton",
+                    "triton_url": self.normalize_endpoint(self.config.triton_url),
+                    "metrics_url": self.config.triton_metrics_url,
+                }}
+                changed = True
+            default = state["instances"]["default"]
+            for meta in state["jobs"].values():
+                if isinstance(meta, dict) and not meta.get("instance_id"):
+                    meta.update(instance_id="default", triton_url=default["triton_url"],
+                                triton_metrics_url=default.get("metrics_url"))
+                    changed = True
+            if changed:
+                self._save_state(state)
+
+    def list_instances(self) -> Dict[str, Any]:
+        return {"default_instance_id": "default", "instances": list(self._load_state()["instances"].values())}
+
+    def save_instance(self, name: str, triton_url: str, metrics_url: str | None = None,
+                      *, instance_id: str | None = None) -> Dict[str, Any]:
+        name = name.strip()
+        if not name:
+            raise HotLoaderError("实例名称不能为空")
+        endpoint = self.normalize_endpoint(triton_url)
+        if metrics_url and metrics_url.strip():
+            metrics = self.normalize_endpoint(metrics_url, metrics=True)
+        else:
+            parts = urlsplit(endpoint)
+            host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+            metrics = f"{parts.scheme}://{host}:8002/metrics"
+        with self._state_lock:
+            state = self._load_state()
+            instances = state["instances"]
+            if instance_id is not None and instance_id not in instances:
+                raise HotLoaderError("Triton 实例不存在")
+            selected_id = instance_id or uuid.uuid4().hex
+            if any(item["triton_url"] == endpoint and key != selected_id for key, item in instances.items()):
+                raise HotLoaderConflictError("该 Triton 地址已登记")
+            previous = instances.get(selected_id)
+            # An existing default may intentionally use Triton's automatic
+            # metrics discovery. A name-only edit must not change that target.
+            if previous and endpoint == previous["triton_url"] and not metrics_url:
+                metrics = previous.get("metrics_url")
+            if previous and (previous["triton_url"] != endpoint or previous.get("metrics_url") != metrics):
+                self._assert_instance_idle(state, selected_id)
+            record = {"id": selected_id, "name": name, "triton_url": endpoint, "metrics_url": metrics}
+            instances[selected_id] = record
+            self._save_state(state)
+            return record
+
+    @staticmethod
+    def _assert_instance_idle(state: Mapping[str, Any], instance_id: str) -> None:
+        for meta in state["jobs"].values():
+            if meta.get("instance_id", "default") != instance_id:
+                continue
+            callback = meta.get("callback") or {}
+            if (meta.get("status") in _ACTIVE_JOB_STATUSES
+                    or (callback and "terminal" in callback.get("events", []) and not callback.get("delivered_at"))):
+                raise HotLoaderConflictError("实例有未结束任务或待投递回调，暂不能修改地址或删除")
+
+    def delete_instance(self, instance_id: str) -> Dict[str, Any]:
+        if instance_id == "default":
+            raise HotLoaderError("默认实例不可删除")
+        with self._state_lock:
+            state = self._load_state()
+            if instance_id not in state["instances"]:
+                raise HotLoaderError("Triton 实例不存在")
+            self._assert_instance_idle(state, instance_id)
+            del state["instances"][instance_id]
+            self._save_state(state)
+        return {"success": True, "instance_id": instance_id}
+
+    def for_instance(self, instance_id: str) -> TritonHotLoader:
+        record = self._load_state()["instances"].get(instance_id)
+        if not record:
+            raise HotLoaderError("Triton 实例不存在，请先添加实例")
+        if (instance_id == self.instance_id and record["triton_url"] == self.config.triton_url
+                and record.get("metrics_url") == self.config.triton_metrics_url):
+            return self
+        loader = TritonHotLoader(self.config.with_updates(
+            triton_url=record["triton_url"], triton_metrics_url=record.get("metrics_url")), instance_id=instance_id)
+        loader._batch_v1_api, loader._core_v1_api = self._batch_v1_api, self._core_v1_api
+        return loader
+
+    def _owns_job(self, meta: Mapping[str, Any]) -> bool:
+        return meta.get("instance_id", "default") == self.instance_id
+
+    def _assert_current_instance(self, state: Mapping[str, Any]) -> None:
+        record = state["instances"].get(self.instance_id)
+        if (not record or record["triton_url"] != self.normalize_endpoint(self.config.triton_url)
+                or record.get("metrics_url") != self.config.triton_metrics_url):
+            raise HotLoaderConflictError("实例配置已变更，请刷新后重试")
 
     def _ensure_runtime_dirs(self) -> None:
         self.config.model_repository.mkdir(parents=True, exist_ok=True)
@@ -559,6 +686,7 @@ class TritonHotLoader:
             raise HotLoaderError("状态文件 jobs 字段格式错误")
 
         return {
+            **data,
             "aliases": aliases,
             "jobs": jobs,
             "updated_at": data.get("updated_at"),
@@ -1191,6 +1319,8 @@ class TritonHotLoader:
                 "annotations": {
                     "hot-loader/model-name": model_name,
                     "hot-loader/image-ref": image_ref,
+                    "hot-loader/instance-id": self.instance_id,
+                    "hot-loader/triton-url": self.config.triton_url,
                 },
             },
             "spec": {
@@ -1489,6 +1619,11 @@ class TritonHotLoader:
             state = self._hydrate_state_aliases(self._load_state())
             jobs = state.setdefault("jobs", {})
             current = dict(jobs.get(job_name, {})) if isinstance(jobs.get(job_name), Mapping) else {}
+            if current and not self._owns_job(current):
+                raise HotLoaderError("Job 不属于当前 Triton 实例")
+            current.setdefault("instance_id", self.instance_id)
+            current.setdefault("triton_url", self.config.triton_url)
+            current.setdefault("triton_metrics_url", self.config.triton_metrics_url)
             current.update(updates)
             current["job_name"] = job_name
             timestamp = self._utc_now()
@@ -1886,6 +2021,8 @@ class TritonHotLoader:
     ) -> Dict[str, Any]:
         with self._model_operation_lock(model_name):
             cached_state = self._load_state().get("jobs", {}).get(job_name, {})
+            if cached_state and not self._owns_job(cached_state):
+                raise HotLoaderError("Job 不属于当前 Triton 实例")
             resolved_target_versions = self._normalize_target_versions(target_versions)
             if isinstance(cached_state, Mapping):
                 final_status = str(cached_state.get("status") or "").upper()
@@ -2039,8 +2176,9 @@ class TritonHotLoader:
     ) -> Dict[str, Any]:
         normalized_model_name, normalized_image_ref = self._resolve_model_name_for_image(model_name, image_ref)
         callback_config = self._normalize_callback_config(callback)
-        with self._model_operation_lock(normalized_model_name):
+        with self._model_operation_lock(normalized_model_name), self._state_lock:
             state = self._load_state()
+            self._assert_current_instance(state)
             for existing_job_name, existing in state.get("jobs", {}).items():
                 if not isinstance(existing, Mapping):
                     continue
@@ -2048,10 +2186,10 @@ class TritonHotLoader:
                     continue
                 if str(existing.get("status") or "").upper() not in _ACTIVE_JOB_STATUSES:
                     continue
-                if existing.get("image") != normalized_image_ref:
+                if not self._owns_job(existing) or existing.get("image") != normalized_image_ref:
                     raise HotLoaderConflictError(
                         f"模型 {normalized_model_name} 已有活跃 operation {existing_job_name}，"
-                        "其镜像不同；请等待当前 operation 进入终态后再提交"
+                        f"所属实例 {existing.get('instance_id', 'default')}；共享仓库的同名模型需等待当前 operation 结束"
                     )
                 return {
                     "success": True,
@@ -2062,6 +2200,8 @@ class TritonHotLoader:
                     "callback_registered": bool(existing.get("callback")),
                     "target_versions": self._normalize_target_versions(existing.get("target_versions")),
                     "reused": True,
+                    "instance_id": self.instance_id,
+                    "triton_url": self.config.triton_url,
                 }
 
             self._assert_job_capacity()
@@ -2100,6 +2240,8 @@ class TritonHotLoader:
                 "callback_registered": bool(callback_config),
                 "target_versions": target_versions,
                 "reused": False,
+                "instance_id": self.instance_id,
+                "triton_url": self.config.triton_url,
             }
 
     def wait_for_job_terminal_state(
@@ -2244,9 +2386,22 @@ class TritonHotLoader:
         }
 
     def get_job_status(self, job_name: str, *, include_logs: bool = True) -> Dict[str, Any]:
-        batch_api = self._get_batch_v1_api()
         cached_jobs = self._load_state().get("jobs", {})
         cached = dict(cached_jobs.get(job_name, {})) if isinstance(cached_jobs.get(job_name), Mapping) else {}
+        if cached and not self._owns_job(cached):
+            raise HotLoaderError("Job 不属于当前 Triton 实例")
+        if str(cached.get("status") or "").upper() in _SYNC_LOAD_TERMINAL_STATUSES:
+            return self._sanitize_job_metadata(cached)
+        if cached.get("triton_url") and (
+            cached["triton_url"] != self.config.triton_url
+            or cached.get("triton_metrics_url") != self.config.triton_metrics_url
+        ):
+            pinned = TritonHotLoader(self.config.with_updates(
+                triton_url=cached["triton_url"], triton_metrics_url=cached.get("triton_metrics_url")),
+                instance_id=self.instance_id)
+            pinned._batch_v1_api, pinned._core_v1_api = self._batch_v1_api, self._core_v1_api
+            return pinned.get_job_status(job_name, include_logs=include_logs)
+        batch_api = self._get_batch_v1_api()
 
         try:
             job = batch_api.read_namespaced_job(
@@ -2300,6 +2455,11 @@ class TritonHotLoader:
                 return self._sanitize_job_metadata(cached)
             raise HotLoaderError(f"查询 Kubernetes Job 失败: {self._exception_text(exc)}") from exc
 
+        annotations = getattr(getattr(job, "metadata", None), "annotations", None) or {}
+        if not cached and annotations.get("hot-loader/instance-id", "default") != self.instance_id:
+            raise HotLoaderError("Job 不属于当前 Triton 实例")
+        if not cached and annotations.get("hot-loader/triton-url", self.config.triton_url) != self.config.triton_url:
+            raise HotLoaderError("Job 目标地址与当前实例不一致")
         pods = self._list_job_pods(job_name)
         pod_name = getattr(getattr(pods[0], "metadata", None), "name", None) if pods else None
         events = self._read_pod_events(pod_name)
@@ -2655,7 +2815,7 @@ class TritonHotLoader:
         jobs = {
             job_name: self._sanitize_job_metadata(meta)
             for job_name, meta in state.get("jobs", {}).items()
-            if isinstance(meta, Mapping)
+            if isinstance(meta, Mapping) and self._owns_job(meta)
         }
         managed_images = sorted(
             [
@@ -2683,6 +2843,7 @@ class TritonHotLoader:
         }
         return {
             "config": self.config.to_dict(),
+            "instance_id": self.instance_id,
             "updated_at": state.get("updated_at"),
             "aliases": aliases,
             "managed_images": managed_images,
@@ -2712,7 +2873,7 @@ class TritonHotLoader:
 
         pending: List[Dict[str, Any]] = []
         for job_name, meta in jobs.items():
-            if not isinstance(meta, Mapping):
+            if not isinstance(meta, Mapping) or not self._owns_job(meta):
                 continue
             callback = meta.get("callback")
             if not isinstance(callback, Mapping):
@@ -2755,6 +2916,8 @@ class TritonHotLoader:
             jobs = state.setdefault("jobs", {})
             current = dict(jobs.get(job_name, {})) if isinstance(jobs.get(job_name), Mapping) else {}
             callback = dict(current.get("callback", {})) if isinstance(current.get("callback"), Mapping) else {}
+            if not self._owns_job(current):
+                raise HotLoaderError("Job 不属于当前 Triton 实例")
             if not callback:
                 raise HotLoaderError(f"Job 未注册 callback: {job_name}")
 
@@ -2789,7 +2952,7 @@ class TritonHotLoader:
         active_entries = [
             (job_name, dict(meta))
             for job_name, meta in jobs.items()
-            if isinstance(meta, Mapping) and str(meta.get("status") or "") in _ACTIVE_JOB_STATUSES
+            if isinstance(meta, Mapping) and self._owns_job(meta) and str(meta.get("status") or "") in _ACTIVE_JOB_STATUSES
         ]
         unchecked_entries = [
             item for item in active_entries if not str(item[1].get("status_checked_at") or "").strip()
@@ -2838,6 +3001,7 @@ class TritonHotLoader:
             gpu_metrics = gpu_metrics_future.result()
         return {
             "triton": {
+                "instance_id": self.instance_id,
                 "url": self.config.triton_url,
                 "ready": ready["ready"],
                 "detail": ready["detail"],

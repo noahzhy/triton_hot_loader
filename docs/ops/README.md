@@ -26,6 +26,28 @@ tritonserver \
 
 ## 3. 必配参数
 
+### 多 Triton 共享仓库部署
+
+多实例模式要求 model-copy Job、controller 和每个 Triton 都能访问同一份模型文件。所有 Triton 的 `--model-repository` 必须指向同一 PVC 的同一模型子目录；容器内路径可以不同，底层文件必须相同。跨节点部署需存储提供方支持共享访问，通常使用 RWX 卷；不要把单节点 RWO 卷当成跨节点共享文件系统。
+
+现有 `deploy/realtime-dev` 示例使用 Pod 内 `emptyDir` 作为在线仓库，适合单实例，不可直接扩成多个独立 Pod 的共享仓库。多实例推荐把 PVC 挂到 `/repository`，将所有 Triton 的仓库设为 `/repository/trt_models`，controller 使用：
+
+```env
+HOT_TRITON_MODEL_REPOSITORY=/repository/trt_models
+MODEL_TARGET_PATH=/repository/trt_models
+HOT_TRITON_STATE_FILE=/repository/.hot_loader/state.json
+HOT_TRITON_STAGING_ROOT=/repository/.staging
+TRITON_REPOSITORY_PVC=triton-models-storage
+```
+
+仅运行一个 controller 副本、一个 Uvicorn worker；当前共享文件状态与模型互斥锁不支持多 controller 进程。实例列表与 Job 共用原子写入的状态文件，迁移前备份此文件。首次启动登记默认实例并将旧 Job 归属默认实例；后续通过 `/api/instances` 编辑地址。
+
+每个 Triton 使用 EXPLICIT 模式、关闭 polling，并确保 controller 能访问登记的 HTTP 与 Metrics 端口。实例 IP 必须指向对应服务器；不要为需要独立控制的实例填写会随机分流到多副本的 Service 地址。
+
+验收时添加 A/B 两个实例，分别加载、卸载、重载同一模型，确认只有目标实例的运行态变化；检查 B 的任务在页面切回 A、controller 重启后仍在 B 完成，回调带 B 的实例 ID。暂时中断 A 后确认 B 的后台任务继续推进。共享配置和版本集合会影响后续 reload，不提供每实例独立版本策略。
+
+### 单实例配置示例
+
 推荐用 `.env` 或环境变量:
 
 ```env

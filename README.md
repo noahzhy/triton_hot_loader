@@ -13,7 +13,43 @@
 
 当前实现已经完全移除热加载链路里的 `docker pull / docker create / docker cp / docker rm / docker.sock` 依赖。
 
-同名模型现在采用直接替换语义：无论镜像新旧，只要解析出的 `model_name` 相同，就覆盖当前仓库里的同名模型；controller 不再对同名模型做额外版本管理。
+同名模型的不同数字版本目录可共存，并使用共享 `version_policy` 加载。支持登记多个 Triton 实例，共用模型仓库，分别控制各实例的加载、卸载和重载。
+
+## 多 Triton 实例
+
+页面顶部选择当前实例，在“管理 Triton 实例”中添加、编辑或删除登记。添加时输入名称、IP 或 HTTP 地址，以及可选 Metrics 地址；纯 IP 默认使用 HTTP 8000、Metrics 8002。自定义 Metrics 端口请填写完整地址。所有模型操作、Job 和 GPU 查询均针对当前实例；共享仓库中的文件和镜像记录由所有实例共用。
+
+实例列表保存在 `HOT_TRITON_STATE_FILE` 的 `instances` 字段，浏览器仅保存选中的 ID。首次启动将环境配置登记为 `default`，旧 Job 自动归属该实例；以后地址修改通过页面或 API 完成，重启或修改环境变量不会覆盖已保存的登记。状态文件必须位于持久化卷。
+
+| 接口 | 用途 |
+| --- | --- |
+| `GET /api/instances` | 返回 `default_instance_id` 和 `instances` 列表 |
+| `POST /api/instances` | 添加实例，返回含固定 `id` 的记录，HTTP 201 |
+| `PUT /api/instances/{id}` | 更新名称和地址，ID 不变 |
+| `DELETE /api/instances/{id}` | 删除登记，保留历史任务及模型文件 |
+
+添加或更新的请求体：
+
+更新时若 HTTP 地址不变且未填写 `metrics_url`，保留已有 Metrics 配置；新实例或更换 HTTP 地址时，省略该字段使用同主机的 8002 端口。
+
+```json
+{"name":"GPU B","triton_url":"10.0.0.8","metrics_url":"http://10.0.0.8:8002/metrics"}
+```
+
+取得返回的 `id` 后，在现有 API 请求中添加 `x-hot-triton-instance-id`：
+
+```bash
+curl -X POST http://127.0.0.1:8090/api/models/load \
+  -H 'Content-Type: application/json' \
+  -H 'x-hot-triton-instance-id: <返回的实例 ID>' \
+  -d '{"model_name":"demo","image":"ccr.ccs.tencentyun.com/clobotics/demo:1"}'
+```
+
+不传实例 ID 时使用 `default`。兼容 header `x-hot-triton-url` / `x-hot-triton-metrics-port` 只能选择已登记的地址，不能与实例 ID 同时使用，未知地址返回 HTTP 400。任务结果和终态回调包含 `instance_id`、提交时的 `triton_url`；后台重试绑定原实例，不受页面切换影响。
+
+同一共享模型有活跃加载任务时，其他实例提交该模型返回 HTTP 409；只有同实例、同镜像的重复提交复用原 Job。不同模型可以并行加载。实例有活跃任务或待投递回调时，修改地址和删除返回 HTTP 409；仍允许只修改名称。默认实例不能删除。
+
+**部署要求：**所有 Triton 必须读取同一共享 PVC 中的模型仓库，不能各自使用独立 `emptyDir`。目前支持单 controller 进程（单副本、单 worker）；详细挂载要求见 [运维说明](docs/ops/README.md#多-triton-共享仓库部署)。共享文件的更新会在其他实例下一次加载/重载时生效，不会自动向所有实例广播重载。部署前应在真实双 Triton/PVC 环境验证。
 
 ## 文档入口
 

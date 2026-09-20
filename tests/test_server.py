@@ -37,6 +37,7 @@ class ServerRoutesTests(unittest.TestCase):
         self.addCleanup(self.client.close)
 
     def test_status_uses_request_header_override_without_mutating_base_loader(self) -> None:
+        self.loader.save_instance("registered", "http://127.0.0.1:19000")
         metrics_payload = {
             "available": False,
             "url": None,
@@ -75,6 +76,7 @@ class ServerRoutesTests(unittest.TestCase):
         self.assertEqual(self.loader.config.triton_url, "http://127.0.0.1:8000")
 
     def test_status_uses_metrics_port_override_with_effective_triton_host(self) -> None:
+        self.loader.save_instance("registered", "http://10.0.0.8:19000", "http://10.0.0.8:19002/metrics")
         def fake_metrics(self):
             return {
                 "available": True,

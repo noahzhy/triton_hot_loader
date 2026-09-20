@@ -16,6 +16,7 @@ def default_config() -> HotLoaderConfig:
 
 def add_common_runtime_args(parser: argparse.ArgumentParser) -> None:
     defaults = default_config()
+    parser.add_argument("--instance-id", default="default", help="已登记的 Triton 实例 ID（默认 default；serve 启动所有实例管理）")
     parser.add_argument(
         "--triton-url",
         default=defaults.triton_url,
@@ -263,7 +264,7 @@ def execute(args: argparse.Namespace) -> int:
         start_server(config, host=args.host, port=args.port)
         return 0
 
-    loader = TritonHotLoader(config)
+    loader = TritonHotLoader(config).for_instance(args.instance_id)
 
     if args.command == "load":
         print_json(loader.create_model_copy_job(args.model_name or "", args.image))

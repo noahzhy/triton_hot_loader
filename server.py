@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hmac
 import json
+import logging
 import threading
 import time
 import uuid
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List
 from urllib.parse import urlsplit, urlunsplit
 
@@ -21,6 +23,7 @@ from hot_loader import HotLoaderConfig, HotLoaderConflictError, HotLoaderError, 
 
 
 TRITON_URL_OVERRIDE_HEADER = "x-hot-triton-url"
+TRITON_INSTANCE_HEADER = "x-hot-triton-instance-id"
 TRITON_METRICS_PORT_OVERRIDE_HEADER = "x-hot-triton-metrics-port"
 _CALLBACK_WATCH_INTERVAL_SECONDS = 2.0
 _CALLBACK_RETRY_BASE_SECONDS = 5.0
@@ -61,6 +64,12 @@ class UnloadRequest(BaseModel):
 
 class ReloadRequest(BaseModel):
     models: List[str] = Field(default_factory=list)
+
+
+class InstanceRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    triton_url: str = Field(min_length=1)
+    metrics_url: str | None = None
 
 
 def _build_netloc_with_port(parts, port: int) -> str:
@@ -147,24 +156,26 @@ def _format_runtime_gpu_status(metrics: Dict[str, object]) -> Dict[str, object]:
 
 def _get_request_loader(request: Request) -> TritonHotLoader:
     base_loader = request.app.state.loader
+    instance_id = request.headers.get(TRITON_INSTANCE_HEADER, "").strip()
     override_url = request.headers.get(TRITON_URL_OVERRIDE_HEADER, "").strip()
     override_metrics_port = request.headers.get(TRITON_METRICS_PORT_OVERRIDE_HEADER, "").strip()
+    if instance_id and (override_url or override_metrics_port):
+        raise HotLoaderError("请只使用实例 ID 或旧地址 header 中的一种")
     if not override_url and not override_metrics_port:
-        return base_loader
-
-    effective_triton_url = override_url or base_loader.config.triton_url
-    effective_metrics_url = base_loader.config.triton_metrics_url
-    if override_metrics_port:
-        effective_metrics_url = _build_metrics_url_from_port(effective_triton_url, override_metrics_port)
-    elif override_url:
-        effective_metrics_url = None
-
-    return TritonHotLoader(
-        base_loader.config.with_updates(
-            triton_url=effective_triton_url,
-            triton_metrics_url=effective_metrics_url,
-        )
-    )
+        return base_loader.for_instance(instance_id or "default")
+    default = base_loader.for_instance("default")
+    endpoint = base_loader.normalize_endpoint(override_url or default.config.triton_url)
+    for record in base_loader.list_instances()["instances"]:
+        if record["triton_url"] != endpoint:
+            continue
+        if override_metrics_port:
+            expected = _build_metrics_url_from_port(endpoint, override_metrics_port)
+            configured = record.get("metrics_url") or _build_metrics_url_from_port(
+                endpoint, str(urlsplit(endpoint).port + 2))
+            if configured != expected:
+                break
+        return base_loader.for_instance(record["id"])
+    raise HotLoaderError("该 Triton 地址或 Metrics 端口尚未登记，请先通过 /api/instances 添加实例")
 
 
 def _callback_retry_delay_seconds(attempts: int) -> float:
@@ -181,6 +192,8 @@ def _callback_event_body(job: Dict[str, object], *, event_id: str, attempt: int)
         "event_id": event_id,
         "event_type": "job.status.changed",
         "job_name": job.get("job_name"),
+        "instance_id": job.get("instance_id", "default"),
+        "triton_url": job.get("triton_url"),
         "model_name": job.get("model_name"),
         "image": job.get("image"),
         "status": job.get("status"),
@@ -234,15 +247,42 @@ def _deliver_terminal_callback(loader: TritonHotLoader, job: Dict[str, object]) 
         )
 
 
-def _background_watch_loop(loader: TritonHotLoader, stop_event: threading.Event) -> None:
-    while not stop_event.is_set():
+def _watch_instance(loader: TritonHotLoader) -> None:
+    try:
+        loader.refresh_active_job_statuses(include_logs=False)
+    except Exception:
+        logging.getLogger(__name__).exception("刷新实例任务失败: %s", loader.instance_id)
+    for job in loader.list_pending_terminal_callbacks():
         try:
-            loader.refresh_active_job_statuses(include_logs=False)
-            for job in loader.list_pending_terminal_callbacks():
-                _deliver_terminal_callback(loader, job)
+            _deliver_terminal_callback(loader, job)
         except Exception:
-            pass
-        stop_event.wait(_CALLBACK_WATCH_INTERVAL_SECONDS)
+            logging.getLogger(__name__).exception("实例回调失败: %s", loader.instance_id)
+
+
+def _background_watch_loop(loader: TritonHotLoader, stop_event: threading.Event) -> None:
+    # One in-flight watcher per instance; a slow/offline endpoint cannot hold up
+    # the remaining instances or cause duplicate callback deliveries.
+    executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="triton-instance")
+    running = {}
+    try:
+        while not stop_event.is_set():
+            try:
+                for record in loader.list_instances()["instances"]:
+                    instance_id = record["id"]
+                    previous = running.get(instance_id)
+                    if previous and not previous.done():
+                        continue
+                    if previous:
+                        try:
+                            previous.result()
+                        except Exception:
+                            logging.getLogger(__name__).exception("实例后台处理失败: %s", instance_id)
+                    running[instance_id] = executor.submit(_watch_instance, loader.for_instance(instance_id))
+            except Exception:
+                logging.getLogger(__name__).exception("读取 Triton 实例列表失败")
+            stop_event.wait(_CALLBACK_WATCH_INTERVAL_SECONDS)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def create_app(loader: TritonHotLoader | None = None, *, enable_background_worker: bool = True) -> FastAPI:
@@ -298,6 +338,23 @@ def create_app(loader: TritonHotLoader | None = None, *, enable_background_worke
     @app.get("/healthz")
     async def healthz() -> Dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/api/instances")
+    async def instances(request: Request) -> Dict[str, object]:
+        return await run_in_threadpool(request.app.state.loader.list_instances)
+
+    @app.post("/api/instances", status_code=201)
+    async def add_instance(payload: InstanceRequest, request: Request) -> Dict[str, object]:
+        return await run_in_threadpool(request.app.state.loader.save_instance, **payload.model_dump())
+
+    @app.put("/api/instances/{instance_id}")
+    async def update_instance(instance_id: str, payload: InstanceRequest, request: Request) -> Dict[str, object]:
+        return await run_in_threadpool(request.app.state.loader.save_instance,
+                                      instance_id=instance_id, **payload.model_dump())
+
+    @app.delete("/api/instances/{instance_id}")
+    async def delete_instance(instance_id: str, request: Request) -> Dict[str, object]:
+        return await run_in_threadpool(request.app.state.loader.delete_instance, instance_id)
 
     @app.get("/runtime/health")
     async def runtime_health(request: Request) -> Dict[str, object]:

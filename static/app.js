@@ -15,15 +15,21 @@ const singleImageInput = document.getElementById("single-image");
 const jobNameInput = document.getElementById("job-name-input");
 const actionModelNameInput = document.getElementById("action-model-name");
 const tritonUrlInput = document.getElementById("triton-url-input");
-const metricsPortInput = document.getElementById("metrics-port-input");
+const metricsUrlInput = document.getElementById("metrics-url-input");
+const instanceNameInput = document.getElementById("instance-name-input");
+const instanceSelect = document.getElementById("instance-select");
+const instanceTarget = document.getElementById("instance-target");
 const operationStatusPanel = document.getElementById("operation-status-panel");
 const operationStatusCaption = document.getElementById("operation-status-caption");
 const operationStatusBadge = document.getElementById("operation-status-badge");
 const operationStatusTitle = document.getElementById("operation-status-title");
 const operationStatusDetail = document.getElementById("operation-status-detail");
 
-const TRITON_URL_STORAGE_KEY = "hot_triton_triton_url";
-const METRICS_PORT_STORAGE_KEY = "hot_triton_metrics_port";
+const INSTANCE_STORAGE_KEY = "hot_triton_instance_id";
+let instances = [];
+let currentInstanceId = localStorage.getItem(INSTANCE_STORAGE_KEY) || "default";
+let instanceRevision = 0;
+class StaleInstanceResponse extends Error {}
 const AUTO_REFRESH_INTERVAL_MS = 5000;
 const MAX_JOB_LIST_ITEMS = 50;
 const API_ROUTES = {
@@ -56,32 +62,25 @@ const INTERACTIVE_BUTTON_IDS = [
     "unload-model-btn",
     "reload-model-btn",
     "load-sample-btn",
-    "save-triton-url-btn",
-    "reset-triton-url-btn",
+    "add-instance-btn",
+    "save-instance-btn",
+    "delete-instance-btn",
     "bulk-unload-triton-btn",
 ];
 
-function getOverrideHeaders() {
-    const headers = {};
-    const tritonUrl = localStorage.getItem(TRITON_URL_STORAGE_KEY)?.trim();
-    const metricsPort = localStorage.getItem(METRICS_PORT_STORAGE_KEY)?.trim();
-    if (tritonUrl) {
-        headers["x-hot-triton-url"] = tritonUrl;
-    }
-    if (metricsPort) {
-        headers["x-hot-triton-metrics-port"] = metricsPort;
-    }
-    return headers;
-}
-
 async function fetchJson(url, options = {}) {
+    const revision = instanceRevision;
+    const { instanceScoped = true, ...requestOptions } = options;
     const headers = {
         "Content-Type": "application/json",
-        ...getOverrideHeaders(),
+        ...(instanceScoped ? { "x-hot-triton-instance-id": currentInstanceId } : {}),
         ...(options.headers || {}),
     };
-    const response = await fetch(url, { ...options, headers });
+    const response = await fetch(url, { ...requestOptions, headers });
     const payload = await response.json().catch(() => ({ success: false, detail: "非 JSON 响应" }));
+    if (instanceScoped && revision !== instanceRevision) {
+        throw new StaleInstanceResponse();
+    }
     if (!response.ok) {
         throw new Error(payload.detail || payload.error || `请求失败: ${response.status}`);
     }
@@ -286,8 +285,9 @@ function setInteractiveButtonsDisabled(disabled) {
         if (!(element instanceof HTMLButtonElement)) {
             return;
         }
-        element.disabled = disabled;
+        element.disabled = disabled || !instances.length || (id === "delete-instance-btn" && currentInstanceId === "default");
     });
+    instanceSelect.disabled = disabled || !instances.length;
 }
 
 function clearPendingButtonState() {
@@ -725,11 +725,12 @@ function renderTritonModels(payload) {
 }
 
 async function refreshAll({ background = false } = {}) {
-    if (refreshInFlight) {
+    const revision = instanceRevision;
+    if (refreshInFlight === revision + 1) {
         return;
     }
 
-    refreshInFlight = true;
+    refreshInFlight = revision + 1;
     try {
         const statusPayload = await fetchJson(API_ROUTES.status);
         renderStatusSummary(statusPayload);
@@ -739,11 +740,11 @@ async function refreshAll({ background = false } = {}) {
         renderGpuStatus(buildGpuStatusPayloadFromMetrics(statusPayload?.triton?.metrics));
         return statusPayload;
     } catch (error) {
-        if (!background) {
+        if (revision === instanceRevision && !background && !(error instanceof StaleInstanceResponse)) {
             throw error;
         }
     } finally {
-        refreshInFlight = false;
+        if (revision === instanceRevision) refreshInFlight = false;
     }
 }
 
@@ -894,16 +895,64 @@ function loadSampleBatch() {
     );
 }
 
-function saveOverrides() {
-    localStorage.setItem(TRITON_URL_STORAGE_KEY, tritonUrlInput.value.trim());
-    localStorage.setItem(METRICS_PORT_STORAGE_KEY, metricsPortInput.value.trim());
+function renderInstances() {
+    instanceSelect.innerHTML = instances.map((item) =>
+        `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)}</option>`).join("");
+    instanceSelect.value = currentInstanceId;
+    const current = instances.find((item) => item.id === currentInstanceId);
+    instanceTarget.textContent = current ? `${current.name} · ${current.triton_url}` : "未选择实例";
+    instanceNameInput.value = current?.name || "";
+    tritonUrlInput.value = current?.triton_url || "";
+    metricsUrlInput.value = current?.metrics_url || "";
+    setInteractiveButtonsDisabled(operationInFlightCount > 0);
 }
 
-function resetOverrides() {
-    localStorage.removeItem(TRITON_URL_STORAGE_KEY);
-    localStorage.removeItem(METRICS_PORT_STORAGE_KEY);
-    tritonUrlInput.value = "";
-    metricsPortInput.value = "";
+async function selectInstance(id) {
+    currentInstanceId = id;
+    instanceRevision += 1;
+    refreshInFlight = false;
+    localStorage.setItem(INSTANCE_STORAGE_KEY, id);
+    selectedTritonModels.clear();
+    tritonRepositoryModels = [];
+    jobNameInput.value = "";
+    actionModelNameInput.value = "";
+    tritonModelFilterInput.value = "";
+    renderInstances();
+    renderTritonModels();
+    statusSummary.textContent = "正在读取当前实例状态…";
+    jobListPanel.textContent = "正在读取当前实例 Job…";
+    managedModelsPanel.textContent = "正在读取共享模型仓库…";
+    gpuMonitorPanel.textContent = "正在读取当前实例 GPU 状态…";
+    gpuMetricsUpdated.textContent = "";
+    renderJson({ instance_id: id });
+    renderIdleOperationState();
+    await refreshAll();
+}
+
+async function loadInstances(preferredId = currentInstanceId) {
+    const payload = await fetchJson("/api/instances", { instanceScoped: false });
+    instances = payload.instances;
+    const selected = instances.some((item) => item.id === preferredId) ? preferredId : payload.default_instance_id;
+    await selectInstance(selected);
+}
+
+async function saveInstance(create) {
+    const payload = {
+        name: instanceNameInput.value.trim(),
+        triton_url: tritonUrlInput.value.trim(),
+        metrics_url: metricsUrlInput.value.trim() || null,
+    };
+    if (!payload.name || !payload.triton_url) throw new Error("请填写实例名称和 Triton IP / HTTP 地址");
+    const record = await fetchJson(create ? "/api/instances" : `/api/instances/${currentInstanceId}`, {
+        method: create ? "POST" : "PUT", body: JSON.stringify(payload), instanceScoped: false,
+    });
+    await loadInstances(record.id);
+}
+
+async function deleteInstance() {
+    if (!window.confirm("删除当前实例登记？此操作不会卸载模型或删除模型文件。")) return;
+    await fetchJson(`/api/instances/${currentInstanceId}`, { method: "DELETE", instanceScoped: false });
+    await loadInstances("default");
 }
 
 async function withResult(action, pendingMessage = "", options = {}) {
@@ -928,6 +977,7 @@ async function withResult(action, pendingMessage = "", options = {}) {
         }
         renderFinishedOperationState("success", successDetail);
     } catch (error) {
+        if (error instanceof StaleInstanceResponse) return;
         renderJson(error.payload || { success: false, detail: error.message });
         renderFinishedOperationState("error", error.message);
     } finally {
@@ -970,8 +1020,17 @@ document.getElementById("reload-model-btn")?.addEventListener("click", () =>
     withResult(reloadModel, "正在重载模型...", { operationLabel: "执行模型重载", buttonId: "reload-model-btn" }),
 );
 document.getElementById("load-sample-btn")?.addEventListener("click", loadSampleBatch);
-document.getElementById("save-triton-url-btn")?.addEventListener("click", saveOverrides);
-document.getElementById("reset-triton-url-btn")?.addEventListener("click", resetOverrides);
+document.getElementById("add-instance-btn")?.addEventListener("click", () =>
+    withResult(() => saveInstance(true), "", { operationLabel: "添加 Triton 实例" }));
+document.getElementById("save-instance-btn")?.addEventListener("click", () =>
+    withResult(() => saveInstance(false), "", { operationLabel: "保存 Triton 实例" }));
+document.getElementById("delete-instance-btn")?.addEventListener("click", () =>
+    withResult(deleteInstance, "", { operationLabel: "删除 Triton 实例登记" }));
+instanceSelect.addEventListener("change", () => {
+    selectInstance(instanceSelect.value).catch((error) => {
+        if (!(error instanceof StaleInstanceResponse)) renderJson({ success: false, detail: error.message });
+    });
+});
 bulkUnloadTritonBtn?.addEventListener("click", () =>
     withResult(unloadSelectedTritonModels, "正在批量热卸载模型...", {
         operationLabel: "执行批量热卸载",
@@ -1013,12 +1072,13 @@ tritonModelBody?.addEventListener("change", (event) => {
     renderTritonModels();
 });
 
-tritonUrlInput.value = localStorage.getItem(TRITON_URL_STORAGE_KEY) || "";
-metricsPortInput.value = localStorage.getItem(METRICS_PORT_STORAGE_KEY) || "";
+localStorage.removeItem("hot_triton_triton_url");
+localStorage.removeItem("hot_triton_metrics_port");
+setInteractiveButtonsDisabled(true);
 loadSampleBatch();
 initCollapsiblePanels();
 renderIdleOperationState();
-refreshAll().catch((error) => {
+loadInstances().catch((error) => {
     renderJson({ success: false, detail: error.message });
     renderFinishedOperationState("error", error.message);
 });
