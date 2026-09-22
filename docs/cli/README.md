@@ -126,17 +126,20 @@ python3 cli.py list
 
 ### `unload`
 
-支持两种卸载方式：
+支持整模型卸载和指定版本下线：
 
 ```bash
 python3 cli.py unload --models demo_model
 python3 cli.py unload --aliases model_demo_model
+python3 cli.py unload --versions demo_model@2
 ```
 
 说明：
 
 - `unload --models` 仍按整个 Triton 模型卸载；同模型多个版本会一起停止。
-- `unload` 仅改变 Triton 运行态，不删除 PVC 模型目录或 controller 管理映射；同一模型可直接用 `reload` 恢复。
+- `--models/--aliases` 仅改变 Triton 运行态，不删除 PVC 模型目录或管理映射，可直接 `reload` 恢复。
+- `--versions model@2` 将指定版本移出仓库，更新策略后仅调用当前实例 load，确认剩余版本 READY 后清理备份。不能混用 `--models/--aliases`，不能删除最后一个版本。
+- 响应 `pending: true` 时需由 `serve` 后台继续推进，或运行 `status` 查询推进；`RECOVERY_REQUIRED` 表示保留备份与模型锁等待恢复确认。明确重载失败时恢复原始文件与配置。
 
 ### `reload`
 

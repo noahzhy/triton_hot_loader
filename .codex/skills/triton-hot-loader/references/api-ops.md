@@ -145,8 +145,9 @@ callback 只支持加载接口，并且当前只支持终态事件。
 
 说明：
 
-- `models` 和 `aliases` 至少要有一个
-- `versions` 已被拒绝，同名版本级卸载不再支持
+- `models/aliases` 为整模型运行态卸载；也可单独传 `versions: ["model@2"]` 移除版本并重载当前实例，禁止混用。
+- 版本下线至少保留一个版本，返回 `operations` 与 `pending`；只有 `SUCCEEDED` 表示切换和备份清理完成。使用 `/api/version-operations/{id}` 查询。
+- 超时保持备份等待确认；明确重载失败恢复原文件，详情见 README 的“指定版本下线与回退”。
 
 ### 重载
 

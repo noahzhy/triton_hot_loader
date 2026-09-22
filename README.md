@@ -15,6 +15,36 @@
 
 同名模型的不同数字版本目录可共存，并使用共享 `version_policy` 加载。支持登记多个 Triton 实例，共用模型仓库，分别控制各实例的加载、卸载和重载。
 
+## 指定版本下线与回退
+
+页面每个版本行的“下线此版本并重载”会移除该版本目录、更新共享 `specific` 策略，并仅向当前实例发送 Load API。不会先卸载整个模型，至少保留一个数字版本。
+
+```bash
+python3 cli.py unload --instance-id default --versions demo@2
+curl -X POST http://127.0.0.1:8090/api/models/unload-batch \
+  -H 'Content-Type: application/json' \
+  -H 'x-hot-triton-instance-id: default' \
+  -d '{"versions":["demo@2"]}'
+```
+
+`/api/unload` 同样支持 `versions`。不能与 `models` 或 `aliases` 混用。重复版本会去重，同模型的多个版本合并成一次重载，不同模型分别返回处理结果。
+
+响应包含 `success`、`pending` 和 `operations`。`pending: true` 表示仍在处理或等待恢复确认，不能当作切换成功；使用 `GET /api/version-operations/{id}`（同一实例 header）或 `GET /api/status` 查看进度。页面任务列表也会展示版本操作。纯 CLI 使用者需运行 `serve` 提供后台续处理，或调用 `status` 推进操作。
+
+| 状态 | 含义 |
+| --- | --- |
+| `VALIDATING` / `PREPARING` | 验证目录与策略，备份并移出版本 |
+| `REQUESTING` / `VERIFYING` | 已准备重载请求或等待剩余版本全部 READY、移除版本不再 READY |
+| `COMMITTING` / `SUCCEEDED` | 已确认切换，更新元数据及清理备份；SUCCEEDED 才表示完成 |
+| `RESTORING` / `FAILED_RESTORED` | 恢复中或失败后已恢复原始配置和目录（验证失败时文件未变） |
+| `RECOVERY_REQUIRED` | 超过重载总时限或恢复/清理异常，保留记录、备份及模型互斥保护 |
+
+备份放在模型仓库的同卷兄弟目录 `.hot-loader-version-backups/<operation_id>/<model>/`，状态文件持久化原始配置与事务阶段。Triton 明确拒绝重载时恢复原文件；网络错误、代理超时或版本尚未收敛时继续查询，不自动恢复可能仍被加载的仓库，也不重复发出结果未知的 Load 请求。重启后后台继续确认；若最终确认切换完成，会清理备份并解除保护。
+
+同名模型存在加载或版本操作时，新的版本下线被拒绝；版本操作未结束时，同名加载、卸载、重载均被阻止，目标实例不能修改地址或删除。`RECOVERY_REQUIRED` 持续保留此保护。排障先核对目标 Triton 是否仍在加载及具体版本状态，不要直接删状态记录解锁；若请求是否执行始终无法确定，需要运维确认 Triton 已停止模型变更后恢复备份和配置，再核对实际运行态。
+
+共享仓库中的移除影响所有实例下次加载，但本操作只重载当前实例。固定请求已删除版本的客户端不会自动改用老版本；序列模型的会话连续性及不中断推理需在实际 Triton/backend 环境验证。Job-only 模式必须使用包含 `/app/version_transaction.py`（协议 1）的本项目维护镜像；缺少脚本时维护 Job 在修改文件前失败。镜像构建后再配置 `REPOSITORY_MAINTENANCE_IMAGE`，单元测试不等于 Kubernetes/GPU 上线验证。
+
 ## 多 Triton 实例
 
 页面顶部选择当前实例，在“管理 Triton 实例”中添加、编辑或删除登记。添加时输入名称、IP 或 HTTP 地址，以及可选 Metrics 地址；纯 IP 默认使用 HTTP 8000、Metrics 8002。自定义 Metrics 端口请填写完整地址。所有模型操作、Job 和 GPU 查询均针对当前实例；共享仓库中的文件和镜像记录由所有实例共用。
@@ -121,6 +151,9 @@ JOB_TOLERATIONS_JSON=[{"key":"gpu","operator":"Exists","effect":"NoSchedule"}]
 
 - Controller 需要能访问 Kubernetes API。
 - Controller 最好与 Triton 共享同一个 Repository PVC。
+- `TRITON_REPOSITORY_PVC` 是 Kubernetes PVC 的 `metadata.name`；controller 创建的 model-copy Job 会将其填入 `persistentVolumeClaim.claimName`，不是容器内路径。
+- `MODEL_TARGET_PATH` 是 model-copy Job 挂载该 PVC 后的写入目录。例如设为 `/repository/trt_models` 时，Job 将 PVC 挂载到 `/repository`，并把模型写入 `${MODEL_TARGET_PATH}/${MODEL_NAME}`。
+- `HOT_TRITON_MODEL_REPOSITORY` 是 Controller 用于检查、同步并调用 Triton 加载的在线模型仓库路径。若 Triton 与 Controller 直接读取同一 PVC，应与 `MODEL_TARGET_PATH` 一致；若 Triton 使用 `emptyDir` 或共享临时卷，则配置为该在线目录，Controller 会在 Job 写入 PVC 后同步模型过去。
 - 现有项目里的模型初始化镜像默认把模型放在 `/trt_models/<model_name>/...`，controller 会优先按这个结构复制；如果镜像里直接是单模型内容目录，也会回退兼容。
 - 生产环境建议把 `HOT_TRITON_STATE_FILE` 和 `HOT_TRITON_STAGING_ROOT` 放在 `trt_models` 目录外层，避免 `.hot_loader/`、`.staging/` 进入 Triton model store。
 - 同名模型的新版本会先与仓库中已有数字版本目录合并到挂载卷里的 `.staging/`，再原子切换到目标目录；controller 会把 `config.pbtxt` 更新为包含所有发现版本的 `specific` 策略，使 Triton 同时加载它们。
@@ -131,6 +164,14 @@ JOB_TOLERATIONS_JSON=[{"key":"gpu","operator":"Exists","effect":"NoSchedule"}]
 - 线上建议保留 `JOB_TTL_SECONDS_AFTER_FINISHED=0`；排查复制或调度问题时，建议临时调大到 `300`，便于直接看 Job / Pod / Event。
 - 如果集群节点带 taint，需要通过 `JOB_TOLERATIONS_JSON` 给动态创建的 model-copy Job 补 tolerations。
 - Triton 必须使用 `EXPLICIT` 模式，且 `repository_poll_secs=0`。
+
+同一 PVC 直读模式的推荐配置：
+
+```env
+TRITON_REPOSITORY_PVC=triton-models-storage
+MODEL_TARGET_PATH=/repository/trt_models
+HOT_TRITON_MODEL_REPOSITORY=/repository/trt_models
+```
 
 临时目录 Triton repository + PVC 同步模式：
 
@@ -150,7 +191,7 @@ TRITON_REPOSITORY_PVC=triton-repository-pvc
 ```
 
 - 这种模式下 Triton 自己只需要挂 `shared-volume`；不需要直接读 PVC。
-- `unload` 始终只改变 Triton 运行态，不会删除 PVC 或临时目录中的模型文件，也不会清除镜像映射；可以直接调用 `reload` 恢复。
+- 按 `models/aliases` 卸载只改变 Triton 运行态，保留文件和镜像映射；`versions` 下线会移除指定版本并自动重载，见上文。
 
 ## HTTP API
 

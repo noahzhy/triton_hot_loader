@@ -967,8 +967,8 @@ class TritonHotLoaderKubernetesJobTests(unittest.TestCase):
         ])
         self.assertNotIn("managed_active_versions", state)
 
-    def test_unload_model_versions_is_rejected_after_version_management_removed(self) -> None:
-        with self.assertRaisesRegex(HotLoaderError, "取消版本管理"):
+    def test_unload_model_versions_requires_maintenance_image_in_job_only_mode(self) -> None:
+        with self.assertRaisesRegex(HotLoaderError, "REPOSITORY_MAINTENANCE_IMAGE"):
             self.loader.unload_model_versions(["demo_model@3"])
 
     def test_version_policy_keeps_all_versions_of_one_model_loaded(self) -> None:

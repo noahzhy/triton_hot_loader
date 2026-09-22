@@ -5,7 +5,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Triton Hot Loader</title>
-    <link rel="stylesheet" href="/static/style.css?v=multi-instance-1">
+    <link rel="stylesheet" href="/static/style.css?v=compact-overview-2">
 </head>
 
 <body>
@@ -27,11 +27,48 @@
         </header>
 
         <main class="page-flow">
-            <section class="panel instance-bar" aria-label="当前 Triton 实例">
-                <label for="instance-select">当前实例</label>
-                <select id="instance-select" class="endpoint-input" disabled><option>正在读取实例…</option></select>
-                <span id="instance-target" class="mono" aria-live="polite"></span>
-                <a href="#instance-management">管理实例</a>
+            <section class="instance-switcher panel-collapsible is-collapsed" aria-labelledby="instance-switcher-title">
+                <div class="instance-switcher-heading">
+                    <div>
+                        <h2 id="instance-switcher-title">Triton 实例</h2>
+                        <p id="instance-target" aria-live="polite">正在读取实例…</p>
+                    </div>
+                    <button class="instance-manage-link panel-collapse-toggle" type="button"
+                        aria-expanded="false" aria-controls="instance-management"
+                        data-collapse-target="instance-management">
+                        <span class="panel-collapse-label" data-collapsed-label="管理实例" data-expanded-label="收起管理">管理实例</span>
+                        <span class="panel-collapse-icon" aria-hidden="true"></span>
+                    </button>
+                </div>
+                <select id="instance-select" class="visually-hidden" aria-label="当前 Triton 实例" disabled>
+                    <option>正在读取实例…</option>
+                </select>
+                <div id="instance-card-grid" class="instance-card-grid" aria-label="Triton 实例列表"></div>
+                <div id="instance-management" class="instance-management-drawer panel-collapsible-body" hidden>
+                    <div class="instance-management-copy">
+                        <h3>管理 Triton 实例</h3>
+                        <p>各实例共用模型文件，加载与卸载只作用于当前实例。</p>
+                    </div>
+                    <div class="instance-management-form">
+                        <label class="endpoint-field">
+                            <span class="filter-label">实例名称</span>
+                            <input id="instance-name-input" class="endpoint-input" type="text" maxlength="120" placeholder="例如 GPU Server A">
+                        </label>
+                        <label class="endpoint-field">
+                            <span class="filter-label">Triton IP / HTTP 地址</span>
+                            <input id="triton-url-input" class="endpoint-input mono" type="text" placeholder="10.0.0.8 或 http://10.0.0.8:8000">
+                        </label>
+                        <label class="endpoint-field">
+                            <span class="filter-label">Metrics 地址（可选，默认同 IP:8002）</span>
+                            <input id="metrics-url-input" class="endpoint-input mono" type="text" placeholder="http://10.0.0.8:8002/metrics">
+                        </label>
+                        <div class="button-group">
+                            <button id="add-instance-btn" class="primary" type="button">添加为新实例</button>
+                            <button id="save-instance-btn" class="ghost" type="button">保存当前实例</button>
+                            <button id="delete-instance-btn" class="danger" type="button">删除当前实例</button>
+                        </div>
+                    </div>
+                </div>
             </section>
             <section class="hero-stage" id="overview">
                 <div class="hero-copy">
@@ -140,31 +177,6 @@
                         </div>
                     </section>
 
-                    <section class="panel composer-panel" id="instance-management">
-                        <div class="section-heading section-heading-compact">
-                            <div>
-                                <h2>管理 Triton 实例</h2>
-                                <p>各实例共用模型文件，加载与卸载只作用于当前实例。</p>
-                            </div>
-                        </div>
-                        <label class="endpoint-field">
-                            <span class="filter-label">实例名称</span>
-                            <input id="instance-name-input" class="endpoint-input" type="text" maxlength="120" placeholder="例如 GPU Server A">
-                        </label>
-                        <label class="endpoint-field">
-                            <span class="filter-label">Triton IP / HTTP 地址</span>
-                            <input id="triton-url-input" class="endpoint-input mono" type="text" placeholder="10.0.0.8 或 http://10.0.0.8:8000">
-                        </label>
-                        <label class="endpoint-field">
-                            <span class="filter-label">Metrics 地址（可选，默认同 IP:8002）</span>
-                            <input id="metrics-url-input" class="endpoint-input mono" type="text" placeholder="http://10.0.0.8:8002/metrics">
-                        </label>
-                        <div class="button-group">
-                            <button id="add-instance-btn" class="primary" type="button">添加为新实例</button>
-                            <button id="save-instance-btn" class="ghost" type="button">保存当前实例</button>
-                            <button id="delete-instance-btn" class="danger" type="button">删除当前实例</button>
-                        </div>
-                    </section>
                 </aside>
 
                 <section class="content" id="monitoring">
@@ -253,7 +265,7 @@
                         <div class="section-heading">
                             <div>
                                 <h2>Triton repository/index</h2>
-                                <p>支持搜索筛选、多选和批量热卸载。</p>
+                                <p>整模型卸载保留文件；版本下线移除共享目录并重载当前实例，至少保留一个版本。</p>
                             </div>
                         </div>
                         <div class="toolbar-row triton-toolbar">
@@ -286,11 +298,12 @@
                                         <th>Version</th>
                                         <th>State</th>
                                         <th>Reason</th>
+                                        <th>版本操作</th>
                                     </tr>
                                 </thead>
                                 <tbody id="triton-model-body">
                                     <tr>
-                                        <td colspan="5" class="empty">暂无 Triton 模型信息</td>
+                                        <td colspan="6" class="empty">暂无 Triton 模型信息</td>
                                     </tr>
                                 </tbody>
                             </table>
@@ -301,7 +314,7 @@
         </main>
     </div>
 
-    <script src="/static/app.js?v=multi-instance-1"></script>
+    <script src="/static/app.js?v=triton-instance-cards-2"></script>
 </body>
 
 </html>

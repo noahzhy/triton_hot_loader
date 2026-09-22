@@ -26,6 +26,18 @@ tritonserver \
 
 ## 3. 必配参数
 
+### 版本下线事务
+
+指定版本下线会将目录移动到仓库外、同文件系统的 `.hot-loader-version-backups/<operation_id>/<model>/`。模型仓库必须位于挂载卷的子目录，例如挂载 `/repository`，仓库为 `/repository/trt_models`；直接把卷挂到仓库目录导致兄弟备份跨文件系统时会拒绝操作。
+
+状态文件必须持久化。恢复时使用原始仓库路径、PVC 和维护镜像配置，不能把待确认事务迁到另一份仓库。共享目录的变更通过单 controller 协调；操作期间不要用其他工具直接修改目录或向同模型发送加载/卸载请求。
+
+Job-only 模式的 `REPOSITORY_MAINTENANCE_IMAGE` 必须使用包含 `/app/version_transaction.py` 的新构建 controller 镜像（协议 1，Python 标准库即可运行）。维护 Job 顺序执行 inspect、prepare、commit 或 restore，`backoffLimit=0`，保留终态 Job 24 小时；controller 通过协议日志确认完成，不会把“Job 已提交”当作文件已改好。
+
+网络超时不会触发立即恢复。后台确认全部剩余版本 READY 且移除版本已退出 READY；超过 `TRITON_RELOAD_TIMEOUT_SECONDS` 标为 `RECOVERY_REQUIRED`，仍保留备份和全局同名模型保护。明确失败恢复后为 `FAILED_RESTORED`，成功清理完成为 `SUCCEEDED`。具体记录可用 `/api/version-operations/{id}` 查看。
+
+真实验收需对当前 Triton 持续发送未指定版本的推理请求，下线新版本后检查剩余版本与请求错误率；固定版本请求、序列模型会话和其他仍使用共享文件的实例应分别验证，不宣称所有场景都可无缝切换。
+
 ### 多 Triton 共享仓库部署
 
 多实例模式要求 model-copy Job、controller 和每个 Triton 都能访问同一份模型文件。所有 Triton 的 `--model-repository` 必须指向同一 PVC 的同一模型子目录；容器内路径可以不同，底层文件必须相同。跨节点部署需存储提供方支持共享访问，通常使用 RWX 卷；不要把单节点 RWO 卷当成跨节点共享文件系统。

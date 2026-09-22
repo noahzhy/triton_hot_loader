@@ -319,14 +319,14 @@ class ServerRoutesTests(unittest.TestCase):
             ["demo_model_a", "demo_model_b"],
         )
 
-    def test_api_unload_route_rejects_version_level_request(self) -> None:
+    def test_api_unload_route_rejects_mixed_version_and_model_request(self) -> None:
         response = self.client.post(
             "/api/unload",
-            json={"versions": ["demo_model@3"]},
+            json={"versions": ["demo_model@3"], "models": ["demo_model"]},
         )
 
         self.assertEqual(response.status_code, 400)
-        self.assertIn("取消版本管理", response.json()["detail"])
+        self.assertIn("不能与", response.json()["detail"])
 
     def test_runtime_gpu_status_route_formats_summary_payload(self) -> None:
         with patch.object(

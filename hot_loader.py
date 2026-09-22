@@ -9,6 +9,7 @@ import time
 import uuid
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
@@ -16,6 +17,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Sequence
 from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
+
+from version_operations import VersionOperations, TERMINAL as VERSION_OPERATION_TERMINAL
 
 
 class HotLoaderError(RuntimeError):
@@ -575,6 +578,9 @@ class TritonHotLoader:
 
     @staticmethod
     def _assert_instance_idle(state: Mapping[str, Any], instance_id: str) -> None:
+        if any(meta.get("instance_id") == instance_id and meta.get("status") not in VERSION_OPERATION_TERMINAL
+               for meta in state.get("version_operations", {}).values()):
+            raise HotLoaderConflictError("实例有未结束版本操作（可能需恢复确认），暂不能修改地址或删除")
         for meta in state["jobs"].values():
             if meta.get("instance_id", "default") != instance_id:
                 continue
@@ -616,6 +622,12 @@ class TritonHotLoader:
                 or record.get("metrics_url") != self.config.triton_metrics_url):
             raise HotLoaderConflictError("实例配置已变更，请刷新后重试")
 
+    def _assert_no_version_operation(self, model_name: str, *, state: Mapping[str, Any] | None = None) -> None:
+        state = state if state is not None else self._load_state()
+        for operation in state.get("version_operations", {}).values():
+            if operation.get("model_name") == model_name and operation.get("status") not in VERSION_OPERATION_TERMINAL:
+                raise HotLoaderConflictError(f"模型 {model_name} 有未结束版本操作 {operation['id']}，状态 {operation['status']}")
+
     def _ensure_runtime_dirs(self) -> None:
         self.config.model_repository.mkdir(parents=True, exist_ok=True)
         self.config.staging_root.mkdir(parents=True, exist_ok=True)
@@ -653,6 +665,16 @@ class TritonHotLoader:
 
     def _model_operation_lock(self, model_name: str) -> threading.RLock:
         return _model_operation_lock_for(self.config.state_file, model_name)
+
+    @contextmanager
+    def _version_submission_lock(self, model_name: str):
+        lock = self._model_operation_lock(model_name)
+        if not lock.acquire(blocking=False):
+            raise HotLoaderConflictError(f"模型 {model_name} 正在执行操作，请稍后重试")
+        try:
+            yield
+        finally:
+            lock.release()
 
     def _uses_repository_sync_mode(self) -> bool:
         return self._uses_job_only_repository() and self._controller_can_access_job_repository_locally()
@@ -699,6 +721,8 @@ class TritonHotLoader:
             )
             with temp_file.open("w", encoding="utf-8") as handle:
                 json.dump(state, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
             temp_file.replace(self.config.state_file)
 
     @staticmethod
@@ -2176,9 +2200,11 @@ class TritonHotLoader:
     ) -> Dict[str, Any]:
         normalized_model_name, normalized_image_ref = self._resolve_model_name_for_image(model_name, image_ref)
         callback_config = self._normalize_callback_config(callback)
+        self._assert_no_version_operation(normalized_model_name)
         with self._model_operation_lock(normalized_model_name), self._state_lock:
             state = self._load_state()
             self._assert_current_instance(state)
+            self._assert_no_version_operation(normalized_model_name, state=state)
             for existing_job_name, existing in state.get("jobs", {}).items():
                 if not isinstance(existing, Mapping):
                     continue
@@ -2853,6 +2879,11 @@ class TritonHotLoader:
             "managed_models": managed_models,
             "managed_model_versions": managed_model_versions,
             "jobs": jobs,
+            "version_operations": {
+                operation_id: VersionOperations.public(operation)
+                for operation_id, operation in state.get("version_operations", {}).items()
+                if self._owns_job(operation)
+            },
             "job_count": len(jobs),
             "active_jobs": sorted(
                 [
@@ -2990,6 +3021,7 @@ class TritonHotLoader:
         return refreshed
 
     def get_status(self) -> Dict[str, Any]:
+        self.refresh_version_operations()
         self.refresh_active_job_statuses(limit=_STATUS_ACTIVE_JOB_REFRESH_LIMIT, include_logs=False)
         state = self.get_managed_state()
         with ThreadPoolExecutor(max_workers=3) as executor:
@@ -3023,7 +3055,9 @@ class TritonHotLoader:
             models = sorted(set(current.get("models", [])))
 
         for model_name in models:
+            self._assert_no_version_operation(model_name)
             with self._model_operation_lock(model_name):
+                self._assert_no_version_operation(model_name)
                 self._unload_model(model_name, tolerate_missing=True)
                 self._wait_for_model_unloaded(model_name)
 
@@ -3052,9 +3086,13 @@ class TritonHotLoader:
         }
 
     def unload_model_versions(self, version_refs: Iterable[str]) -> Dict[str, Any]:
-        if any(str(version_ref or "").strip() for version_ref in version_refs):
-            raise HotLoaderError("同名模型已取消版本管理，请按 model_name 或 alias 卸载")
-        raise HotLoaderError("请至少提供一个 model name 或 alias")
+        return VersionOperations(self).submit(version_refs)
+
+    def get_version_operation(self, operation_id: str) -> Dict[str, Any]:
+        return VersionOperations(self).advance(operation_id)
+
+    def refresh_version_operations(self) -> List[Dict[str, Any]]:
+        return VersionOperations(self).refresh()
 
     def unload_models(self, model_names: Iterable[str]) -> Dict[str, Any]:
         unique_models = sorted({model_name for model_name in model_names if model_name})
@@ -3062,7 +3100,9 @@ class TritonHotLoader:
             raise HotLoaderError("请至少提供一个 model name")
 
         for model_name in unique_models:
+            self._assert_no_version_operation(model_name)
             with self._model_operation_lock(model_name):
+                self._assert_no_version_operation(model_name)
                 self._unload_model(model_name, tolerate_missing=True)
                 self._wait_for_model_unloaded(model_name)
 
@@ -3081,7 +3121,9 @@ class TritonHotLoader:
 
         reloaded = []
         for model_name in unique_models:
+            self._assert_no_version_operation(model_name)
             with self._model_operation_lock(model_name):
+                self._assert_no_version_operation(model_name)
                 self._load_model(model_name)
                 reloaded.append(model_name)
 

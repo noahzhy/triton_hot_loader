@@ -249,6 +249,10 @@ def _deliver_terminal_callback(loader: TritonHotLoader, job: Dict[str, object]) 
 
 def _watch_instance(loader: TritonHotLoader) -> None:
     try:
+        loader.refresh_version_operations()
+    except Exception:
+        logging.getLogger(__name__).exception("刷新版本操作失败: %s", loader.instance_id)
+    try:
         loader.refresh_active_job_statuses(include_logs=False)
     except Exception:
         logging.getLogger(__name__).exception("刷新实例任务失败: %s", loader.instance_id)
@@ -410,7 +414,9 @@ def create_app(loader: TritonHotLoader | None = None, *, enable_background_worke
         if not payload.aliases and not payload.models and not payload.versions:
             raise HotLoaderError("请至少选择一个 alias 或 model")
         if payload.versions:
-            raise HotLoaderError("同名模型已取消版本管理，请按 model_name 或 alias 卸载")
+            if payload.models or payload.aliases:
+                raise HotLoaderError("versions 不能与 models/aliases 混用")
+            return loader.unload_model_versions(payload.versions)
 
         alias_result = None
         model_result = None
@@ -471,6 +477,10 @@ def create_app(loader: TritonHotLoader | None = None, *, enable_background_worke
     @app.get("/api/jobs/{job_name}")
     async def api_job_status(job_name: str, request: Request) -> Dict[str, object]:
         return await run_in_threadpool(_get_request_loader(request).get_job_status, job_name)
+
+    @app.get("/api/version-operations/{operation_id}")
+    async def version_operation(operation_id: str, request: Request) -> Dict[str, object]:
+        return await run_in_threadpool(_get_request_loader(request).get_version_operation, operation_id)
 
     @app.post("/api/models/unload")
     async def api_unload_model(payload: ModelActionRequest, request: Request) -> Dict[str, object]:

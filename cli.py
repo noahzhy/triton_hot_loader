@@ -182,7 +182,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--versions",
         nargs="*",
         default=[],
-        help="已废弃；同名模型不再支持按版本管理和卸载",
+        help="移除 model_name@version 并自动重载当前实例；至少保留一个版本",
     )
 
     reload_parser = subparsers.add_parser("reload", help="重载指定模型")
@@ -288,9 +288,13 @@ def execute(args: argparse.Namespace) -> int:
 
     if args.command == "unload":
         if not args.aliases and not args.models and not args.versions:
-            raise HotLoaderError("unload 至少要提供 --aliases 或 --models 之一")
+            raise HotLoaderError("unload 至少要提供 --aliases、--models 或 --versions 之一")
         if args.versions:
-            raise HotLoaderError("同名模型已取消版本管理，请改用 --models 或 --aliases")
+            if args.models or args.aliases:
+                raise HotLoaderError("--versions 不能与 --models/--aliases 混用")
+            result = loader.unload_model_versions(args.versions)
+            print_json(result)
+            return 0 if result["success"] or result["pending"] else 1
 
         payload = {}
         if args.aliases:

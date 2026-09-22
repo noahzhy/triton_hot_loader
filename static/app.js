@@ -19,6 +19,7 @@ const metricsUrlInput = document.getElementById("metrics-url-input");
 const instanceNameInput = document.getElementById("instance-name-input");
 const instanceSelect = document.getElementById("instance-select");
 const instanceTarget = document.getElementById("instance-target");
+const instanceCardGrid = document.getElementById("instance-card-grid");
 const operationStatusPanel = document.getElementById("operation-status-panel");
 const operationStatusCaption = document.getElementById("operation-status-caption");
 const operationStatusBadge = document.getElementById("operation-status-badge");
@@ -209,7 +210,7 @@ function getStatusTone(value) {
         return "neutral";
     }
 
-    if (normalized === "READY" || normalized === "OK" || normalized === "MODEL_READY") {
+    if (["READY", "OK", "MODEL_READY", "SUCCEEDED"].includes(normalized)) {
         return "positive";
     }
 
@@ -288,6 +289,12 @@ function setInteractiveButtonsDisabled(disabled) {
         element.disabled = disabled || !instances.length || (id === "delete-instance-btn" && currentInstanceId === "default");
     });
     instanceSelect.disabled = disabled || !instances.length;
+    document.querySelectorAll(".instance-card").forEach((card) => {
+        card.disabled = disabled || !instances.length;
+    });
+    document.querySelectorAll("[data-remove-version]").forEach((button) => {
+        button.disabled = disabled || !instances.length;
+    });
 }
 
 function clearPendingButtonState() {
@@ -343,7 +350,9 @@ function setCollapsiblePanelExpanded(button, expanded) {
         panel.classList.toggle("is-collapsed", !expanded);
     }
     if (label) {
-        label.textContent = expanded ? "收起" : "展开";
+        label.textContent = expanded
+            ? (label.dataset.expandedLabel || "收起")
+            : (label.dataset.collapsedLabel || "展开");
     }
 }
 
@@ -610,8 +619,8 @@ function renderStatusSummary(payload) {
         </div>
         <div class="summary-card">
             <h3>模型仓库</h3>
-            <p><strong>路径:</strong> ${config.model_repository || "-"}</p>
-            <p><strong>目标挂载:</strong> ${config.model_target_path || "-"}</p>
+            <p><strong>路径:</strong> <span title="${escapeHtml(config.model_repository || "-")}">已配置</span></p>
+            <p><strong>目标挂载:</strong> <span title="${escapeHtml(config.model_target_path || "-")}">已配置</span></p>
             <p><strong>已管理模型:</strong> ${manager.managed_model_count || 0}</p>
         </div>
     `;
@@ -640,7 +649,8 @@ function renderManagedModels(payload) {
 }
 
 function renderJobs(payload) {
-    const jobs = payload.manager?.jobs || payload.managed?.jobs || payload.jobs || {};
+    const manager = payload.manager || payload.managed || payload;
+    const jobs = { ...(manager.jobs || {}), ...(manager.version_operations || {}) };
     const entries = Object.entries(jobs).sort((a, b) => {
         const aTime = a[1]?.updated_at || "";
         const bTime = b[1]?.updated_at || "";
@@ -665,11 +675,12 @@ function renderJobs(payload) {
             const detail = meta.detail || meta.error || "-";
             return `
                 <article class="managed-card">
-                    <h3>${jobName}</h3>
-                    <p><strong>模型:</strong> ${meta.model_name || "-"}</p>
+                    <h3>${meta.versions ? "版本下线 · " : ""}${escapeHtml(jobName)}</h3>
+                    <p><strong>模型:</strong> ${escapeHtml(meta.model_name || "-")}</p>
+                    ${meta.versions ? `<p><strong>移除版本:</strong> ${escapeHtml(meta.versions.join(", "))}</p>` : ""}
                     <p><strong>状态:</strong> ${renderStatusValue(meta.status || "-")}</p>
                     <p><strong>Pod:</strong> ${meta.pod_name || "-"}</p>
-                    <p><strong>详情:</strong> ${detail}</p>
+                    <p><strong>详情:</strong> ${escapeHtml(detail)}</p>
                 </article>
             `;
         })
@@ -688,12 +699,12 @@ function renderTritonModels(payload) {
     updateTritonSelectionControls(visibleModels);
 
     if (!tritonRepositoryModels.length) {
-        tritonModelBody.innerHTML = '<tr><td colspan="5" class="empty">暂无 Triton 模型信息</td></tr>';
+        tritonModelBody.innerHTML = '<tr><td colspan="6" class="empty">暂无 Triton 模型信息</td></tr>';
         return;
     }
 
     if (!visibleModels.length) {
-        tritonModelBody.innerHTML = '<tr><td colspan="5" class="empty">没有匹配的 Triton 模型</td></tr>';
+        tritonModelBody.innerHTML = '<tr><td colspan="6" class="empty">没有匹配的 Triton 模型</td></tr>';
         return;
     }
 
@@ -718,6 +729,9 @@ function renderTritonModels(payload) {
                     <td>${escapeHtml(item.version || "-")}</td>
                     <td>${renderStatusValue(state)}</td>
                     <td>${escapeHtml(item.reason || "-")}</td>
+                    <td>${modelName && /^(0|[1-9][0-9]*)$/.test(String(item.version)) ? `
+                        <button type="button" class="danger" data-remove-version="${encodeURIComponent(`${modelName}@${item.version}`)}"
+                            ${operationInFlightCount > 0 ? "disabled" : ""}>下线此版本并重载</button>` : "-"}</td>
                 </tr>
             `;
         })
@@ -878,6 +892,18 @@ async function reloadModel() {
     }
 }
 
+async function removeVersion(versionRef) {
+    const current = instances.find((item) => item.id === currentInstanceId);
+    if (!window.confirm(`下线 ${versionRef} 并重载 ${current?.name}（${current?.triton_url}）？\n将从共享模型仓库移除该版本，仅重载当前实例；其他实例下次加载也将受影响。最后一个版本不能删除。`)) return;
+    const result = await fetchJson(API_ROUTES.unloadSelection, {
+        method: "POST", body: JSON.stringify({ versions: [versionRef] }),
+    });
+    renderJson(result);
+    await refreshAll();
+    if (!result.pending) assertBusinessSuccess(result, result.operations?.[0]?.detail || "版本下线失败");
+    return result;
+}
+
 function loadSampleBatch() {
     batchInput.value = JSON.stringify(
         {
@@ -900,7 +926,28 @@ function renderInstances() {
         `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)}</option>`).join("");
     instanceSelect.value = currentInstanceId;
     const current = instances.find((item) => item.id === currentInstanceId);
-    instanceTarget.textContent = current ? `${current.name} · ${current.triton_url}` : "未选择实例";
+    instanceTarget.textContent = current ? `当前连接：${current.name} · ${current.triton_url}` : "未选择实例";
+    instanceCardGrid.innerHTML = instances.map((item) => {
+        const isCurrent = item.id === currentInstanceId;
+        return `
+            <button class="instance-card${isCurrent ? " is-selected" : ""}" type="button"
+                data-instance-id="${escapeHtml(item.id)}"
+                aria-pressed="${isCurrent}" aria-label="选择 ${escapeHtml(item.name)}，${escapeHtml(item.triton_url)}">
+                <span class="instance-card-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" focusable="false">
+                        <path d="M7 7.5 12 4l5 3.5v9L12 20l-5-3.5z"/>
+                        <circle cx="12" cy="4" r="1.5"/><circle cx="7" cy="7.5" r="1.5"/>
+                        <circle cx="17" cy="7.5" r="1.5"/><circle cx="7" cy="16.5" r="1.5"/>
+                        <circle cx="17" cy="16.5" r="1.5"/><circle cx="12" cy="20" r="1.5"/>
+                    </svg>
+                </span>
+                <span class="instance-card-copy">
+                    <strong>${escapeHtml(item.name)}</strong>
+                    <span>${escapeHtml(item.triton_url)}</span>
+                </span>
+                <span class="instance-card-check" aria-hidden="true">✓</span>
+            </button>`;
+    }).join("");
     instanceNameInput.value = current?.name || "";
     tritonUrlInput.value = current?.triton_url || "";
     metricsUrlInput.value = current?.metrics_url || "";
@@ -1031,6 +1078,13 @@ instanceSelect.addEventListener("change", () => {
         if (!(error instanceof StaleInstanceResponse)) renderJson({ success: false, detail: error.message });
     });
 });
+instanceCardGrid?.addEventListener("click", (event) => {
+    const card = event.target.closest(".instance-card");
+    if (!(card instanceof HTMLButtonElement) || card.disabled || card.dataset.instanceId === currentInstanceId) return;
+    selectInstance(card.dataset.instanceId).catch((error) => {
+        if (!(error instanceof StaleInstanceResponse)) renderJson({ success: false, detail: error.message });
+    });
+});
 bulkUnloadTritonBtn?.addEventListener("click", () =>
     withResult(unloadSelectedTritonModels, "正在批量热卸载模型...", {
         operationLabel: "执行批量热卸载",
@@ -1070,6 +1124,15 @@ tritonModelBody?.addEventListener("change", (event) => {
         selectedTritonModels.delete(modelName);
     }
     renderTritonModels();
+});
+
+tritonModelBody?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-remove-version]");
+    if (!button || button.disabled) return;
+    withResult(() => removeVersion(decodeURIComponent(button.dataset.removeVersion)), "", {
+        operationLabel: "移除指定版本并重载当前实例",
+        successDetail: "版本操作已处理；最终结果及待确认状态请查看任务列表。",
+    });
 });
 
 localStorage.removeItem("hot_triton_triton_url");

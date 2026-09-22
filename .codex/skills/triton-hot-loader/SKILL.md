@@ -49,7 +49,7 @@ description: "Use when working in this repository on Triton hot-loading workflow
 - `load` 使用 `--image`，`--model-name` 可选
 - `load-batch` 使用 `--file` 或 `--json`
 - `reload` 只触发 Triton `load`，不会先显式 `unload`
-- `unload --versions` 已废弃且会被拒绝，应该改用 `--models` 或 `--aliases`
+- `unload --versions model@2` 移出指定版本、更新策略并重载当前实例；至少保留一个版本，不能与 `--models/--aliases` 混用；待确认操作保留备份和模型互斥保护
 - HTTP API 上 `wait_for_ready` 默认是 `false`
 - callback 当前只支持终态事件
 - 如果 `HOT_TRITON_MODEL_REPOSITORY` 与 `MODEL_TARGET_PATH` 不同，controller 会进入 repository sync 模式
