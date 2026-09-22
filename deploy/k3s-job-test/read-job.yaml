@@ -1,0 +1,28 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: job-read-marker
+  namespace: triton-job-test
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 30
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: reader
+          image: busybox:1.36
+          command:
+            - sh
+            - -ec
+            - |
+              test -s /workspace/probe/marker
+              marker="$(cat /workspace/probe/marker)"
+              echo "MARKER=$marker"
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: job-test-workspace

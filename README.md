@@ -86,6 +86,7 @@ curl -X POST http://127.0.0.1:8090/api/models/load \
 - 运维简要配置与说明: [docs/ops/README.md](docs/ops/README.md)
 - CLI 使用说明: [docs/cli/README.md](docs/cli/README.md)
 - realtime-dev 部署说明: [deploy/realtime-dev/README.md](deploy/realtime-dev/README.md)
+- 单节点 K3s Job 测试环境: [deploy/k3s-job-test/README.md](deploy/k3s-job-test/README.md)
 
 ## 架构
 

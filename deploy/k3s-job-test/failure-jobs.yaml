@@ -1,0 +1,37 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: job-image-pull-failure
+  namespace: triton-job-test
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: unavailable-image
+          image: busybox:this-tag-must-not-exist-20260922
+          command: ["sh", "-c", "echo should-not-run"]
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: job-wrong-mount-path
+  namespace: triton-job-test
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 30
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: invalid-reader
+          image: busybox:1.36
+          command: ["sh", "-ec", "test -f /wrong-path/probe/marker"]
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: job-test-workspace

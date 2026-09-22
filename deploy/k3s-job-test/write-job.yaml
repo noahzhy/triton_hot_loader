@@ -1,0 +1,30 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: job-write-marker
+  namespace: triton-job-test
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 30
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: writer
+          image: busybox:1.36
+          command:
+            - sh
+            - -ec
+            - |
+              marker="$(date -u +%Y%m%dT%H%M%SZ)-$(cat /proc/sys/kernel/random/uuid)"
+              mkdir -p /workspace/probe
+              printf '%s\n' "$marker" > /workspace/probe/marker
+              sync
+              echo "MARKER=$marker"
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: job-test-workspace
