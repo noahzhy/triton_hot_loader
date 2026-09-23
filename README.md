@@ -15,9 +15,22 @@
 
 同名模型的不同数字版本目录可共存，并使用共享 `version_policy` 加载。支持登记多个 Triton 实例，共用模型仓库，分别控制各实例的加载、卸载和重载。
 
+### Triton 启动参数
+
+Controller 通过 Triton Repository API 显式执行模型 `load/unload`。每个受管理的 Triton 实例都必须使用 `EXPLICIT` 模型控制模式，并关闭 repository polling：
+
+```bash
+tritonserver \
+  --model-repository=/repository/trt_models \
+  --model-control-mode=EXPLICIT \
+  --repository-poll-secs=0
+```
+
+若使用 `--repository-poll-secs`，请将其设为 `0`；不要启用非零轮询。Polling 与显式 load/unload 冲突时，Triton 会拒绝 API 请求并返回 `explicit model load / unload is not allowed if polling is enabled`。Kubernetes Deployment 中应检查 Triton 容器的 `command/args`，修改启动参数后重启 Triton Pod。`--load-model=*` 可按需用于 Triton 启动时预加载仓库中的模型，不替代以上控制模式和 polling 设置。
+
 ## 指定版本下线与回退
 
-页面每个版本行的“下线此版本并重载”会移除该版本目录、更新共享 `specific` 策略，并仅向当前实例发送 Load API。不会先卸载整个模型，至少保留一个数字版本。
+页面每个版本行的“下线此版本并重载”会移除该版本目录、更新共享 `specific` 策略，并**必须重载当前 Triton 实例**，使运行态按新版本策略重新收敛。只移除磁盘目录不会切换 Triton 当前加载的版本；重载并确认剩余版本 `READY` 是下线完成的必要步骤。此操作不会先卸载整个模型，且至少保留一个数字版本。
 
 ```bash
 python3 cli.py unload --instance-id default --versions demo@2
@@ -29,7 +42,7 @@ curl -X POST http://127.0.0.1:8090/api/models/unload-batch \
 
 `/api/unload` 同样支持 `versions`。不能与 `models` 或 `aliases` 混用。重复版本会去重，同模型的多个版本合并成一次重载，不同模型分别返回处理结果。
 
-响应包含 `success`、`pending` 和 `operations`。`pending: true` 表示仍在处理或等待恢复确认，不能当作切换成功；使用 `GET /api/version-operations/{id}`（同一实例 header）或 `GET /api/status` 查看进度。页面任务列表也会展示版本操作。纯 CLI 使用者需运行 `serve` 提供后台续处理，或调用 `status` 推进操作。
+响应包含 `success`、`pending` 和 `operations`。下线版本后必须完成 Triton reload，并确认剩余版本 `READY`；`pending: true` 表示重载/确认仍在处理或等待恢复确认，不能当作切换成功。使用 `GET /api/version-operations/{id}`（同一实例 header）或 `GET /api/status` 查看进度。页面任务列表也会展示版本操作。纯 CLI 使用者需运行 `serve` 提供后台续处理，或调用 `status` 推进操作。
 
 | 状态 | 含义 |
 | --- | --- |
@@ -84,6 +97,7 @@ curl -X POST http://127.0.0.1:8090/api/models/load \
 ## 文档入口
 
 - 运维简要配置与说明: [docs/ops/README.md](docs/ops/README.md)
+- HTTP API 完整使用说明: [docs/api/README.md](docs/api/README.md)
 - CLI 使用说明: [docs/cli/README.md](docs/cli/README.md)
 - realtime-dev 部署说明: [deploy/realtime-dev/README.md](deploy/realtime-dev/README.md)
 - 单节点 K3s Job 测试环境: [deploy/k3s-job-test/README.md](deploy/k3s-job-test/README.md)
@@ -128,6 +142,28 @@ TRITON_REPOSITORY_PVC=triton-repository-pvc
 TRITON_URL=http://triton:8000
 TRITON_METRICS_URL=http://triton:8002/metrics
 K8S_NAMESPACE=default
+```
+
+### PVC 与模型仓库路径
+
+| 环境变量 | 用途 | 示例 |
+| --- | --- | --- |
+| `TRITON_REPOSITORY_PVC` | PVC 的 `metadata.name`，供复制 Job 挂载 | `triton-repository-pvc` |
+| `MODEL_SOURCE_PATH` | 镜像内模型目录 | `/trt_models` |
+| `MODEL_TARGET_PATH` | PVC 内模型仓库目录 | `/repository/trt_models` |
+| `HOT_TRITON_MODEL_REPOSITORY` | Triton 在线仓库路径 | `/repository/trt_models` |
+| `HOT_TRITON_STATE_FILE` | 持久化 Controller 状态文件 | `/repository/.hot_loader/state.json` |
+| `HOT_TRITON_STAGING_ROOT` | 仓库外的暂存目录 | `/repository/.staging` |
+
+PVC 名称不是容器路径。目标路径为 `/repository/trt_models` 时，复制 Job 将 PVC 挂到 `/repository`。直读模式下，Controller 和 Triton 都挂载该 PVC，且在线仓库路径与目标路径一致；临时仓库模式下，Controller 同时挂载 PVC 和临时卷并负责同步，Triton 只挂临时卷。
+
+PVC volume 示例：
+
+```yaml
+volumes:
+  - name: model-repository
+    persistentVolumeClaim:
+      claimName: triton-repository-pvc
 ```
 
 可选：

@@ -6,6 +6,7 @@ IMAGE_NAME="${IMAGE_NAME:-ccr.ccs.tencentyun.com/clobotics/triton-hot-loader}"
 TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d-%H%M%S)}"
 FULL_TAG="${IMAGE_NAME}:${TIMESTAMP}"
 LATEST_TAG="${IMAGE_NAME}:latest"
+UPDATE_LATEST_TAG="${UPDATE_LATEST_TAG:-1}"
 DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/amd64}"
 PYTHON_BASE_IMAGE="${PYTHON_BASE_IMAGE:-docker.m.daocloud.io/library/python:3.11-slim}"
 APT_MIRROR="${APT_MIRROR:-http://mirrors.tuna.tsinghua.edu.cn/debian}"
@@ -14,8 +15,13 @@ PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
 PIP_TRUSTED_HOST="${PIP_TRUSTED_HOST:-pypi.tuna.tsinghua.edu.cn}"
 
 BUILD_OUTPUT_ARGS=()
+BUILD_TAG_ARGS=(-t "${FULL_TAG}")
 HAS_EXPLICIT_OUTPUT=0
 IS_MULTI_PLATFORM=0
+
+if [[ "${UPDATE_LATEST_TAG}" == "1" ]]; then
+    BUILD_TAG_ARGS+=(-t "${LATEST_TAG}")
+fi
 
 if [[ "${DOCKER_PLATFORM}" == *,* ]]; then
     IS_MULTI_PLATFORM=1
@@ -56,8 +62,7 @@ BUILD_CMD=(
     --build-arg "PIP_INDEX_URL=${PIP_INDEX_URL}"
     --build-arg "PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST}"
     -f "${SCRIPT_DIR}/Dockerfile"
-    -t "${FULL_TAG}"
-    -t "${LATEST_TAG}"
+    "${BUILD_TAG_ARGS[@]}"
     "${SCRIPT_DIR}"
 )
 
@@ -68,4 +73,6 @@ fi
 "${BUILD_CMD[@]}"
 
 echo "[hot_triton] build completed: ${FULL_TAG}"
-echo "[hot_triton] latest tag updated: ${LATEST_TAG}"
+if [[ "${UPDATE_LATEST_TAG}" == "1" ]]; then
+    echo "[hot_triton] latest tag updated: ${LATEST_TAG}"
+fi
